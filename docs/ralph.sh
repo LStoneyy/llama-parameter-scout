@@ -5,17 +5,20 @@ set -Eeuo pipefail
 # Place this file at: <repo>/docs/ralph.sh
 #
 # Usage:
-#   ./ralph.sh                  # up to 50 iterations
-#   ./ralph.sh 10               # up to 10 iterations
-#   MAX_ITERATIONS=0 ./ralph.sh # unlimited; completion marker still stops it
+#   ./docs/ralph.sh             # up to 50 iterations
+#   ./docs/ralph.sh 10          # up to 10 iterations
+#   MAX_ITERATIONS=0 ./docs/ralph.sh # unlimited; completion marker still stops it
 #
 # Optional environment variables:
 #   OPENCODE_BIN=opencode
-#   OPENCODE_COMMAND=implement  # set to an empty string to disable --command
+#   OPENCODE_COMMAND=implement  # set to an empty string to bypass --command
 #   OPENCODE_AUTO=1             # set to 0 to disable --auto
 #   OPENCODE_MODEL=provider/model
 #   OPENCODE_AGENT=build
 #   OPENCODE_ATTACH=http://localhost:4096
+#   OPENCODE_PRINT_LOGS=1       # include OpenCode's internal logs
+#   OPENCODE_LOG_LEVEL=DEBUG    # DEBUG, INFO, WARN, or ERROR
+#   OPENCODE_PURE=0             # set to 1 to disable external plugins
 #   SLEEP_SECONDS=2
 #   ALLOW_DIRTY=0               # set to 1 only when intentional
 
@@ -23,6 +26,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROMPT_FILE="${SCRIPT_DIR}/RALPH-PROMPT.md"
 PRD_FILE="${SCRIPT_DIR}/PRD.md"
 ISSUES_DIR="${SCRIPT_DIR}/issues"
+LOG_DIR="${SCRIPT_DIR}/ralph-logs"
 
 OPENCODE_BIN="${OPENCODE_BIN:-opencode}"
 OPENCODE_COMMAND="${OPENCODE_COMMAND-implement}"
@@ -30,6 +34,9 @@ OPENCODE_AUTO="${OPENCODE_AUTO:-1}"
 OPENCODE_MODEL="${OPENCODE_MODEL:-}"
 OPENCODE_AGENT="${OPENCODE_AGENT:-}"
 OPENCODE_ATTACH="${OPENCODE_ATTACH:-}"
+OPENCODE_PRINT_LOGS="${OPENCODE_PRINT_LOGS:-1}"
+OPENCODE_LOG_LEVEL="${OPENCODE_LOG_LEVEL:-DEBUG}"
+OPENCODE_PURE="${OPENCODE_PURE:-0}"
 SLEEP_SECONDS="${SLEEP_SECONDS:-2}"
 ALLOW_DIRTY="${ALLOW_DIRTY:-0}"
 MAX_ITERATIONS="${1:-${MAX_ITERATIONS:-50}}"
@@ -37,6 +44,10 @@ MAX_ITERATIONS="${1:-${MAX_ITERATIONS:-50}}"
 fail() {
   printf 'ralph: %s\n' "$*" >&2
   exit 1
+}
+
+is_boolean() {
+  [[ "$1" == "0" || "$1" == "1" ]]
 }
 
 command -v git >/dev/null 2>&1 || fail "git was not found in PATH"
@@ -47,8 +58,12 @@ command -v "$OPENCODE_BIN" >/dev/null 2>&1 || fail "$OPENCODE_BIN was not found 
 [[ -d "$ISSUES_DIR" ]] || fail "missing issues directory: $ISSUES_DIR"
 [[ "$MAX_ITERATIONS" =~ ^[0-9]+$ ]] || fail "MAX_ITERATIONS must be a non-negative integer"
 [[ "$SLEEP_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail "SLEEP_SECONDS must be a non-negative number"
-[[ "$OPENCODE_AUTO" == "0" || "$OPENCODE_AUTO" == "1" ]] || fail "OPENCODE_AUTO must be 0 or 1"
-[[ "$ALLOW_DIRTY" == "0" || "$ALLOW_DIRTY" == "1" ]] || fail "ALLOW_DIRTY must be 0 or 1"
+is_boolean "$OPENCODE_AUTO" || fail "OPENCODE_AUTO must be 0 or 1"
+is_boolean "$OPENCODE_PRINT_LOGS" || fail "OPENCODE_PRINT_LOGS must be 0 or 1"
+is_boolean "$OPENCODE_PURE" || fail "OPENCODE_PURE must be 0 or 1"
+is_boolean "$ALLOW_DIRTY" || fail "ALLOW_DIRTY must be 0 or 1"
+[[ "$OPENCODE_LOG_LEVEL" =~ ^(DEBUG|INFO|WARN|ERROR)$ ]] \
+  || fail "OPENCODE_LOG_LEVEL must be DEBUG, INFO, WARN, or ERROR"
 
 REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)" \
   || fail "$SCRIPT_DIR is not inside a Git repository"
@@ -57,16 +72,26 @@ if [[ "$GIT_DIR" != /* ]]; then
   GIT_DIR="${REPO_ROOT}/${GIT_DIR}"
 fi
 
-LOG_DIR="${GIT_DIR}/ralph-logs"
+# Resolve the log directory relative to the repository so that Git status checks
+# can ignore generated Ralph logs without requiring a committed .gitignore.
+SCRIPT_PREFIX="$(git -C "$SCRIPT_DIR" rev-parse --show-prefix)"
+LOG_DIR_REL="${SCRIPT_PREFIX}ralph-logs"
 LOCK_DIR="${GIT_DIR}/ralph-loop.lock"
 mkdir -p "$LOG_DIR"
+
+repo_status() {
+  git -C "$REPO_ROOT" status --porcelain=v1 --untracked-files=all -- \
+    . \
+    ":(exclude)${LOG_DIR_REL}" \
+    ":(exclude)${LOG_DIR_REL}/**"
+}
 
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   fail "another Ralph loop appears to be running: $LOCK_DIR"
 fi
 trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 
-if [[ "$ALLOW_DIRTY" != "1" ]] && [[ -n "$(git -C "$REPO_ROOT" status --porcelain=v1)" ]]; then
+if [[ "$ALLOW_DIRTY" != "1" ]] && [[ -n "$(repo_status)" ]]; then
   fail "the repository is not clean; commit or stash changes first, or set ALLOW_DIRTY=1"
 fi
 
@@ -79,11 +104,16 @@ while (( MAX_ITERATIONS == 0 || iteration <= MAX_ITERATIONS )); do
   before_head="$(git -C "$REPO_ROOT" rev-parse --verify HEAD 2>/dev/null || printf 'UNBORN')"
   prompt="$(<"$PROMPT_FILE")"
 
-  printf '\n=== Ralph iteration %d ===\n' "$iteration"
-  printf 'Working directory: %s\n' "$SCRIPT_DIR"
-  printf 'Log: %s\n\n' "$log_file"
+  command=("$OPENCODE_BIN")
+  if [[ "$OPENCODE_PRINT_LOGS" == "1" ]]; then
+    command+=(--print-logs)
+  fi
+  command+=(--log-level "$OPENCODE_LOG_LEVEL")
+  if [[ "$OPENCODE_PURE" == "1" ]]; then
+    command+=(--pure)
+  fi
 
-  command=("$OPENCODE_BIN" run --dir "$SCRIPT_DIR" --title "Ralph iteration ${iteration}")
+  command+=(run --dir "$SCRIPT_DIR" --title "Ralph iteration ${iteration}")
 
   if [[ "$OPENCODE_AUTO" == "1" ]]; then
     command+=(--auto)
@@ -102,23 +132,45 @@ while (( MAX_ITERATIONS == 0 || iteration <= MAX_ITERATIONS )); do
   fi
   command+=("$prompt")
 
+  {
+    printf '\n=== Ralph iteration %d ===\n' "$iteration"
+    printf 'Working directory: %s\n' "$SCRIPT_DIR"
+    printf 'Log: %s\n' "$log_file"
+    printf 'OpenCode version: '
+    "$OPENCODE_BIN" --version 2>&1 || true
+    printf 'Command:'
+    printf ' %q' "${command[@]}"
+    printf '\n\n'
+  } | tee "$log_file"
+
   set +e
-  "${command[@]}" 2>&1 | tee "$log_file"
+  "${command[@]}" 2>&1 | tee -a "$log_file"
   opencode_status=${PIPESTATUS[0]}
   set -e
 
   if (( opencode_status != 0 )); then
+    if grep -Fq 'Unexpected server error' "$log_file"; then
+      cat >&2 <<EOF
+ralph: OpenCode returned a generic server error.
+ralph: This log includes --print-logs with log level ${OPENCODE_LOG_LEVEL}.
+ralph: OpenCode also keeps native logs under ~/.local/share/opencode/log/ on macOS/Linux.
+ralph: To isolate the custom /implement command, run once with:
+ralph:   OPENCODE_COMMAND= ./docs/ralph.sh 1
+ralph: To additionally isolate external plugins, run once with:
+ralph:   OPENCODE_COMMAND= OPENCODE_PURE=1 ./docs/ralph.sh 1
+EOF
+    fi
     fail "OpenCode exited with status $opencode_status; see $log_file"
   fi
 
   after_head="$(git -C "$REPO_ROOT" rev-parse --verify HEAD 2>/dev/null || printf 'UNBORN')"
   repository_dirty=0
-  if [[ -n "$(git -C "$REPO_ROOT" status --porcelain=v1)" ]]; then
+  if [[ -n "$(repo_status)" ]]; then
     repository_dirty=1
   fi
 
   completed=0
-  if grep -Fq 'RALPH_COMPLETE' "$log_file"; then
+  if grep -Fxq 'RALPH_COMPLETE' "$log_file"; then
     completed=1
   fi
 
