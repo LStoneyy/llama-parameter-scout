@@ -1,5 +1,5 @@
 # AI related stuff
-docs/
+# docs/
 
 # Python bytecode and caches
 __pycache__/
