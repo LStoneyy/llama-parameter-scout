@@ -1,0 +1,108 @@
+# AI related stuff
+docs/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyright/
+.cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging and build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Test and coverage output
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+tmp/
+temp/
+
+# Environment and local configuration
+.env
+.env.*
+!.env.example
+*.local.toml
+*.local.yaml
+*.local.yml
+config.local.*
+.llama-parameter-scout/
+
+# Benchmark output
+results/
+reports/
+benchmarks/output/
+benchmark-results/
+*.benchmark.json
+*.benchmark.csv
+
+# Local models and model-related files
+*.gguf
+*.ggml
+models/
+model-cache/
+
+# llama.cpp local installations and builds
+llama.cpp/
+llama-cpp/
+vendor/llama.cpp/
+bin/
+lib/
+*.dll
+*.dylib
+*.so
+*.so.*
+*.exe
+
+# IDEs and editors
+.idea/
+.vscode/
+*.code-workspace
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Operating system files
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Windows crash dumps
+*.dmp
+
+# macOS debug symbols
+*.dSYM/
+
+# Linux core dumps
+core
+core.*
+
+# PyInstaller
+*.spec
