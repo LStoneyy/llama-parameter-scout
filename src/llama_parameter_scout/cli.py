@@ -186,6 +186,13 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Maximum seconds for each candidate process launch (default: no timeout)",
     )
 
+    # ── TUI mode ─────────────────────────────────────────────────
+    parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="Launch the Textual TUI wizard",
+    )
+
     # ── Session listing mode ─────────────────────────────────────
     parser.add_argument(
         "--list-sessions",
@@ -357,6 +364,13 @@ def _require_benchmark_args(args: argparse.Namespace) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
+
+    # ── TUI mode ────────────────────────────────────────────────
+    if args.tui:
+        from .tui import ScoutTuiApp as _ScoutTuiApp
+        tui_app = _ScoutTuiApp()
+        tui_app.run()
+        return
 
     # ── List-sessions mode ──────────────────────────────────────
     if args.list_sessions:

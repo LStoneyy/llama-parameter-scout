@@ -56,6 +56,8 @@ from .models import (
     NoAcceleratorSelectedError,
     NonpositiveBudgetError,
     NoWinnerReport,
+    ProgressCallback,
+    ProgressEvent,
     ResourceBudget,
     ScoutError,
     ScreeningDisposition,
@@ -1581,6 +1583,7 @@ class Application:
         session_id: str | None = None,
         parent_session_id: str | None = None,
         completed_search_results: tuple[ScreeningResult, ...] = (),
+        on_progress: ProgressCallback | None = None,
     ) -> ScreeningReport:
         _validate_request(request)
 
@@ -1590,17 +1593,42 @@ class Application:
                 prior_by_candidate[r.candidate] = deque()
             prior_by_candidate[r.candidate].append(r)
 
+        def _emit(stage: str, message: str, **kw: Any) -> None:
+            if on_progress is not None:
+                on_progress(ProgressEvent(stage=stage, message=message, **kw))
+
         def _wrap_for_prior_and_journal(
             inner: ScreeningEvaluator,
         ) -> ScreeningEvaluator:
+            _eval_counter: int = 0
+
             def wrapped(
                 candidate: CandidateConfig,
                 n_ctx: NctxComposition,
                 repetitions: int,
             ) -> ScreeningResult:
+                nonlocal _eval_counter
                 if candidate in prior_by_candidate and prior_by_candidate[candidate]:
-                    return prior_by_candidate[candidate].popleft()
+                    result = prior_by_candidate[candidate].popleft()
+                    return result
+                _eval_counter += 1
+                _emit(
+                    "screening",
+                    f"Evaluating candidate {candidate.threads}t/{candidate.batch_size}b"
+                    f"/{candidate.ubatch_size}ub ngl={candidate.n_gpu_layers}",
+                    candidate=candidate,
+                    index=_eval_counter,
+                )
                 result = inner(candidate, n_ctx, repetitions)
+                reason_short = result.reason[:120] if result.reason else "ok"
+                _emit(
+                    "screening",
+                    f"Candidate {result.disposition}: {reason_short}",
+                    candidate=candidate,
+                    disposition=result.disposition,
+                    index=_eval_counter,
+                    is_error=not result.success,
+                )
                 if session_id is not None:
                     try:
                         write_measurement_completed(
@@ -1638,9 +1666,11 @@ class Application:
             return report
 
         # Inspect toolchain and model once, before the search.
+        _emit("screening", "Inspecting toolchain...")
         try:
             toolchain = inspect_toolchain(self._runner, request.binary_path)
         except ScoutError as e:
+            _emit("screening", f"Toolchain inspection failed: {e}", is_error=True)
             baseline = ScreeningResult(
                 candidate=request.candidate, success=False,
                 disposition="unsupported", reason=str(e),
@@ -1664,10 +1694,13 @@ class Application:
                 objective=objective,
                 disposition_summary="Toolchain inspection failed; no evaluations attempted",
             )
+        _emit("screening", f"Toolchain: {toolchain.binary_path.name} v{toolchain.version}")
 
+        _emit("screening", "Inspecting model...")
         try:
             model = inspect_model(request.model_path)
         except ScoutError as e:
+            _emit("screening", f"Model inspection failed: {e}", is_error=True)
             baseline = ScreeningResult(
                 candidate=request.candidate, success=False,
                 disposition="unsupported", reason=str(e),
@@ -1691,8 +1724,10 @@ class Application:
                 objective=objective,
                 disposition_summary="Model inspection failed; no evaluations attempted",
             )
+        _emit("screening", f"Model: {model.path.name} ({model.architecture})")
 
         if session_spec is not None and session_spec.model != model:
+            _emit("screening", "Model fingerprint mismatch with session spec", is_error=True)
             baseline = ScreeningResult(
                 candidate=request.candidate, success=False,
                 disposition="unsupported",
@@ -1842,8 +1877,36 @@ class Application:
         validation_evaluator: ValidationEvaluator | None = None,
         session_spec: SessionSpecification | None = None,
         policy: ExecutionPolicy | None = None,
+        on_progress: ProgressCallback | None = None,
     ) -> ValidatedRecommendation | NoWinnerReport:
         _validate_request(request)
+
+        def _emit(stage: str, message: str, **kw: Any) -> None:
+            if on_progress is not None:
+                on_progress(ProgressEvent(stage=stage, message=message, **kw))
+
+        def _wrap_validator(inner: ValidationEvaluator) -> ValidationEvaluator:
+            def wrapped(
+                candidate: CandidateConfig,
+                n_ctx: NctxComposition,
+            ) -> ScreeningResult:
+                _emit(
+                    "validation",
+                    f"Validating candidate {candidate.threads}t/{candidate.batch_size}b "
+                    f"ngl={candidate.n_gpu_layers}...",
+                    candidate=candidate,
+                )
+                result = inner(candidate, n_ctx)
+                reason_short = result.reason[:120] if result.reason else "ok"
+                _emit(
+                    "validation",
+                    f"Validated {result.disposition}: {reason_short}",
+                    candidate=candidate,
+                    disposition=result.disposition,
+                    is_error=not result.success,
+                )
+                return result
+            return wrapped
 
         if validation_evaluator is not None:
             ve_budget = session_spec.budget if session_spec is not None else None
@@ -1856,14 +1919,16 @@ class Application:
                 requested_n_ctx=request.n_ctx,
                 objective=objective,
                 budget=budget,
-                evaluator=validation_evaluator,
+                evaluator=_wrap_validator(validation_evaluator),
                 resource_budget=ve_budget,
                 memory_unified=ve_memory_unified,
             )
 
+        _emit("validation", "Inspecting toolchain for validation...")
         try:
             toolchain = inspect_toolchain(self._runner, request.binary_path)
         except ScoutError as e:
+            _emit("validation", f"Toolchain inspection failed: {e}", is_error=True)
             return NoWinnerReport(
                 provisional_leader=screening_report.leader,
                 failures=(
@@ -1878,9 +1943,11 @@ class Application:
                 pareto_frontier=screening_report.pareto_frontier,
             )
 
+        _emit("validation", "Inspecting model for validation...")
         try:
             model = inspect_model(request.model_path)
         except ScoutError as e:
+            _emit("validation", f"Model inspection failed: {e}", is_error=True)
             return NoWinnerReport(
                 provisional_leader=screening_report.leader,
                 failures=(
@@ -1915,7 +1982,7 @@ class Application:
             requested_n_ctx=request.n_ctx,
             objective=objective,
             budget=budget,
-            evaluator=_production_validator,
+            evaluator=_wrap_validator(_production_validator),
             resource_budget=res_budget,
             memory_unified=mem_unified,
         )
@@ -2118,6 +2185,7 @@ class Application:
         ] | None = None,
         _warmup_fn: Callable[[int], None] | None = None,
         _measure_fn: Callable[[int], float] | None = None,
+        on_progress: ProgressCallback | None = None,
     ) -> MtpProfileReport:
         from .mtp import (
             collect_mtp_evidence as _collect_mtp_evidence,
@@ -2125,6 +2193,10 @@ class Application:
         from .mtp import (
             collect_mtp_profile as _collect_mtp_profile,
         )
+
+        def _emit(stage: str, message: str, **kw: Any) -> None:
+            if on_progress is not None:
+                on_progress(ProgressEvent(stage=stage, message=message, **kw))
 
         if profile is None:
             profile = MtpSearchProfile()
@@ -2142,6 +2214,8 @@ class Application:
         main_model_path = main_fp.path
         memory_unified = session_spec.topology.memory_unified
 
+        _emit("mtp_profile", "Starting MTP profile collection...")
+
         def _resolve_evidence(
             main_candidate: CandidateConfig,
         ) -> MemoryEvidence | None:
@@ -2157,6 +2231,12 @@ class Application:
             draft_settings: MtpDraftSettings,
         ) -> tuple[MtpComparison, MemoryEvidence]:
             candidate_evidence = _resolve_evidence(main_candidate)
+            _emit(
+                "mtp_profile",
+                f"Evaluating draft: ngl={draft_settings.n_gpu_layers_draft}, "
+                f"max={draft_settings.draft_max}",
+                candidate=main_candidate,
+            )
             evidence = _collect_mtp_evidence(
                 candidate=main_candidate,
                 main_model_path=main_model_path,
