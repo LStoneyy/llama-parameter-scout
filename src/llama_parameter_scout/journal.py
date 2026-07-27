@@ -6,12 +6,28 @@ import tempfile
 from dataclasses import asdict
 from pathlib import Path
 
-from .models import BenchmarkObservation, ModelFingerprint, ShardFingerprint, ToolchainFingerprint
+from .models import (
+    Accelerator,
+    BenchmarkObservation,
+    ContextAdvisory,
+    ModelFingerprint,
+    ResourceBudget,
+    SessionSpecification,
+    ShardFingerprint,
+    SystemTopology,
+    ToolchainFingerprint,
+)
 
 
-def write_observation(path: Path, observation: BenchmarkObservation) -> None:
+def write_observation(
+    path: Path,
+    observation: BenchmarkObservation,
+    session_spec: SessionSpecification | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     data = _observation_to_dict(observation)
+    if session_spec is not None:
+        data["session_spec"] = _session_spec_to_dict(session_spec)
     fd, tmp_path = tempfile.mkstemp(
         dir=str(path.parent),
         prefix=f".{path.name}.",
@@ -33,7 +49,7 @@ def write_observation(path: Path, observation: BenchmarkObservation) -> None:
 
 def _observation_to_dict(obs: BenchmarkObservation) -> dict[str, object]:
     return {
-        "version": 2,
+        "version": 3,
         "candidate": asdict(obs.candidate),
         "total_ctx": obs.total_ctx,
         "prompt_ctx": obs.prompt_ctx,
@@ -48,6 +64,60 @@ def _observation_to_dict(obs: BenchmarkObservation) -> dict[str, object]:
         "model_path": str(obs.model_path),
         "toolchain": _toolchain_to_dict(obs.toolchain),
         "model": _model_to_dict(obs.model),
+    }
+
+
+def _session_spec_to_dict(spec: SessionSpecification) -> dict[str, object]:
+    return {
+        "cpu_only": spec.cpu_only,
+        "selected_device_ids": list(spec.selected_device_ids),
+        "n_ctx": asdict(spec.n_ctx),
+        "acknowledged": spec.acknowledged,
+        "fingerprint": spec.fingerprint,
+        "topology": _topology_to_dict(spec.topology),
+        "budget": _budget_to_dict(spec.budget),
+        "advisory": _advisory_to_dict(spec.advisory),
+        "model": _model_to_dict(spec.model),
+    }
+
+
+def _topology_to_dict(t: SystemTopology) -> dict[str, object]:
+    return {
+        "cpu_count": t.cpu_count,
+        "system_memory_bytes": t.system_memory_bytes,
+        "accelerators": [_accelerator_to_dict(a) for a in t.accelerators],
+        "memory_unified": t.memory_unified,
+    }
+
+
+def _accelerator_to_dict(a: Accelerator) -> dict[str, object]:
+    return {
+        "kind": a.kind,
+        "backend": a.backend,
+        "device_id": a.device_id,
+        "description": a.description,
+        "memory_bytes": a.memory_bytes,
+    }
+
+
+def _budget_to_dict(b: ResourceBudget) -> dict[str, object]:
+    return {
+        "ram_bytes": b.ram_bytes,
+        "vram_bytes": b.vram_bytes,
+        "headroom_ratio": b.headroom_ratio,
+    }
+
+
+def _advisory_to_dict(a: ContextAdvisory) -> dict[str, object]:
+    return {
+        "likely_fit_lower": a.likely_fit_lower,
+        "likely_fit_upper": a.likely_fit_upper,
+        "uncertain_maximum": a.uncertain_maximum,
+        "model_weight_bytes": a.model_weight_bytes,
+        "kv_cache_bytes_estimate": a.kv_cache_bytes_estimate,
+        "training_context_status": a.training_context_status,
+        "training_context_tokens": a.training_context_tokens,
+        "note": a.note,
     }
 
 

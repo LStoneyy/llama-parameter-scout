@@ -203,6 +203,43 @@ class TestInspectModel:
         assert len(fp.shards) == 2
         assert fp.architecture == "llama"
 
+    def test_shard_context_length_conflict_detected(self, tmp_path: Path) -> None:
+        base = tmp_path / "model-00001-of-00002.gguf"
+        build_gguf(base, {
+            "general.architecture": (8, "llama"),
+            "llama.context_length": (10, 4096),
+            "split.no": (5, 0),
+            "split.count": (5, 2),
+        })
+        s2 = tmp_path / "model-00002-of-00002.gguf"
+        build_gguf(s2, {
+            "general.architecture": (8, "llama"),
+            "llama.context_length": (10, 8192),
+            "split.no": (5, 1),
+            "split.count": (5, 2),
+        })
+        fp = inspect_model(base)
+        assert fp.context_length is None
+        assert any("conflict" in d for d in fp.diagnostics)
+
+    def test_shard_context_length_agreement(self, tmp_path: Path) -> None:
+        base = tmp_path / "model-00001-of-00002.gguf"
+        build_gguf(base, {
+            "general.architecture": (8, "llama"),
+            "llama.context_length": (10, 4096),
+            "split.no": (5, 0),
+            "split.count": (5, 2),
+        })
+        s2 = tmp_path / "model-00002-of-00002.gguf"
+        build_gguf(s2, {
+            "general.architecture": (8, "llama"),
+            "llama.context_length": (10, 4096),
+            "split.no": (5, 1),
+            "split.count": (5, 2),
+        })
+        fp = inspect_model(base)
+        assert fp.context_length == 4096
+
     def test_split_count_non_primary_rejected(self, tmp_path: Path) -> None:
         base = tmp_path / "model-00001-of-00002.gguf"
         build_gguf(base, {

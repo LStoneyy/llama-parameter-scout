@@ -13,6 +13,7 @@ from llama_parameter_scout.application import (
     _validate_request,
 )
 from llama_parameter_scout.models import (
+    Accelerator,
     BinaryNotFoundError,
     CandidateConfig,
     CandidateError,
@@ -20,14 +21,42 @@ from llama_parameter_scout.models import (
     JournalError,
     MalformedOutputError,
     ModelFingerprint,
+    ModelFingerprintMismatchError,
     ModelNotFoundError,
     NctxComposition,
+    SessionSetupError,
     SingleRunRequest,
     SubprocessError,
+    SystemTopology,
     ToolchainError,
     ToolchainFingerprint,
 )
 from llama_parameter_scout.runner import FakeRunner, ProcessResult
+
+
+def _enqueue_toolchain_with_gpu_flags(
+    runner: FakeRunner,
+    bp: Path,
+    backends: tuple[str, ...] = ("cpu",),
+) -> None:
+    runner.enqueue(
+        (str(bp), "--version"),
+        ProcessResult(
+            returncode=0,
+            stdout=(
+                "version: test123\n"
+                f"backends: {','.join(backends)}\n"
+                "supported_flags: -m,-p,-n,-d,-t,-b,-ub,-ngl,-fa,-ctk,-ctv,-o,-r,"
+                "--split-mode,--main-gpu\n"
+                "supported_output_formats: json\n"
+            ),
+            stderr="",
+        ),
+    )
+    runner.enqueue(
+        (str(bp), "--help"),
+        ProcessResult(returncode=0, stdout="usage: llama-bench\n", stderr=""),
+    )
 
 
 def _enqueue_toolchain(runner: FakeRunner, bp: Path) -> None:
@@ -321,7 +350,7 @@ class TestApplication:
 
         assert valid_request.journal_path.exists()
         journal = json.loads(valid_request.journal_path.read_text())
-        assert journal["version"] == 2
+        assert journal["version"] == 3
         assert journal["candidate"]["threads"] == 4
         assert journal["total_ctx"] == 2048
         assert journal["samples_tps"] == [45.5, 44.8, 45.3]
@@ -582,3 +611,206 @@ class TestApplication:
         with pytest.raises(InvalidNctxError):
             app.run(req)
         assert len(fake_runner.calls) == 0
+
+    def test_model_fingerprint_mismatch_before_warmup(
+        self,
+        fake_runner: FakeRunner,
+        fake_binary: Path,
+        fake_model: Path,
+        tmp_path: Path,
+        valid_json_output: str,
+    ) -> None:
+        from llama_parameter_scout.model_inspector import inspect_model
+        from tests.conftest import _build_minimal_gguf
+
+        model_fp = inspect_model(fake_model)
+        _enqueue_toolchain(fake_runner, fake_binary)
+
+        app = Application(fake_runner)
+        spec = app.setup_session(
+            model=model_fp,
+            n_ctx=NctxComposition(total=2048, prompt=512, generation=1024, depth=512),
+            candidate=CandidateConfig(
+                threads=4, batch_size=512, ubatch_size=512,
+                n_gpu_layers=0, flash_attn=False,
+                cache_type_k="f16", cache_type_v="f16",
+            ),
+            cpu_only=True,
+            acknowledged=True,
+        )
+
+        _build_minimal_gguf(fake_model, {"general.architecture": (8, "deepseek")})
+
+        req = SingleRunRequest(
+            binary_path=fake_binary,
+            model_path=fake_model,
+            journal_path=tmp_path / "journal.json",
+            n_ctx=NctxComposition(total=2048, prompt=512, generation=1024, depth=512),
+            candidate=CandidateConfig(
+                threads=4, batch_size=512, ubatch_size=512,
+                n_gpu_layers=0, flash_attn=False,
+                cache_type_k="f16", cache_type_v="f16",
+            ),
+        )
+        with pytest.raises(ModelFingerprintMismatchError):
+            app.run(req, session_spec=spec)
+
+        assert len(fake_runner.calls) == 2
+
+    def test_session_spec_accelerated_unsupported_backend(
+        self,
+        fake_runner: FakeRunner,
+        fake_binary: Path,
+        fake_model: Path,
+        tmp_path: Path,
+        valid_json_output: str,
+    ) -> None:
+        from llama_parameter_scout.model_inspector import inspect_model
+
+        model_fp = inspect_model(fake_model)
+
+        topology = SystemTopology(
+            cpu_count=8,
+            system_memory_bytes=32_000_000_000,
+            accelerators=(
+                Accelerator("gpu", "hip", 0, "AMD GPU", memory_bytes=16_000_000_000),
+            ),
+            memory_unified=False,
+        )
+
+        app = Application(fake_runner, detect_topology_fn=lambda: topology)
+        spec = app.setup_session(
+            model=model_fp,
+            n_ctx=NctxComposition(total=2048, prompt=512, generation=1024, depth=512),
+            candidate=CandidateConfig(
+                threads=4, batch_size=512, ubatch_size=512,
+                n_gpu_layers=20, flash_attn=False,
+                cache_type_k="f16", cache_type_v="f16",
+            ),
+            cpu_only=False,
+            device_ids=(0,),
+            acknowledged=True,
+        )
+
+        _enqueue_toolchain_with_gpu_flags(
+            fake_runner, fake_binary, backends=("cpu", "cuda"),
+        )
+
+        req = SingleRunRequest(
+            binary_path=fake_binary,
+            model_path=fake_model,
+            journal_path=tmp_path / "journal.json",
+            n_ctx=NctxComposition(total=2048, prompt=512, generation=1024, depth=512),
+            candidate=CandidateConfig(
+                threads=4, batch_size=512, ubatch_size=512,
+                n_gpu_layers=20, flash_attn=False,
+                cache_type_k="f16", cache_type_v="f16",
+            ),
+        )
+        with pytest.raises(SessionSetupError, match="hip"):
+            app.run(req, session_spec=spec)
+
+    def test_session_spec_accelerated_supported_backend(
+        self,
+        fake_runner: FakeRunner,
+        fake_binary: Path,
+        fake_model: Path,
+        tmp_path: Path,
+        valid_json_output: str,
+    ) -> None:
+        from llama_parameter_scout.model_inspector import inspect_model
+
+        model_fp = inspect_model(fake_model)
+
+        topology = SystemTopology(
+            cpu_count=8,
+            system_memory_bytes=32_000_000_000,
+            accelerators=(
+                Accelerator("gpu", "cuda", 0, "RTX 4090", memory_bytes=24_000_000_000),
+            ),
+            memory_unified=False,
+        )
+
+        app = Application(fake_runner, detect_topology_fn=lambda: topology)
+        spec = app.setup_session(
+            model=model_fp,
+            n_ctx=NctxComposition(total=2048, prompt=512, generation=1024, depth=512),
+            candidate=CandidateConfig(
+                threads=4, batch_size=512, ubatch_size=512,
+                n_gpu_layers=20, flash_attn=False,
+                cache_type_k="f16", cache_type_v="f16",
+            ),
+            cpu_only=False,
+            device_ids=(0,),
+            acknowledged=True,
+        )
+
+        _enqueue_toolchain_with_gpu_flags(
+            fake_runner, fake_binary, backends=("cpu", "cuda"),
+        )
+
+        warmup_argv = _build_argv(
+            SingleRunRequest(
+                binary_path=fake_binary,
+                model_path=fake_model,
+                journal_path=tmp_path / "journal.json",
+                n_ctx=NctxComposition(total=2048, prompt=512, generation=1024, depth=512),
+                candidate=CandidateConfig(
+                    threads=4, batch_size=512, ubatch_size=512,
+                    n_gpu_layers=20, flash_attn=False,
+                    cache_type_k="f16", cache_type_v="f16",
+                ),
+            ),
+            repetitions=1,
+            session_spec=spec,
+        )
+        measure_argv = _build_argv(
+            SingleRunRequest(
+                binary_path=fake_binary,
+                model_path=fake_model,
+                journal_path=tmp_path / "journal.json",
+                n_ctx=NctxComposition(total=2048, prompt=512, generation=1024, depth=512),
+                candidate=CandidateConfig(
+                    threads=4, batch_size=512, ubatch_size=512,
+                    n_gpu_layers=20, flash_attn=False,
+                    cache_type_k="f16", cache_type_v="f16",
+                ),
+            ),
+            repetitions=3,
+            session_spec=spec,
+        )
+        fake_runner.enqueue(
+            warmup_argv,
+            ProcessResult(returncode=0, stdout=valid_json_output, stderr=""),
+        )
+        fake_runner.enqueue(
+            measure_argv,
+            ProcessResult(returncode=0, stdout=valid_json_output, stderr=""),
+        )
+
+        obs = app.run(
+            SingleRunRequest(
+                binary_path=fake_binary,
+                model_path=fake_model,
+                journal_path=tmp_path / "journal.json",
+                n_ctx=NctxComposition(total=2048, prompt=512, generation=1024, depth=512),
+                candidate=CandidateConfig(
+                    threads=4, batch_size=512, ubatch_size=512,
+                    n_gpu_layers=20, flash_attn=False,
+                    cache_type_k="f16", cache_type_v="f16",
+                ),
+            ),
+            session_spec=spec,
+        )
+
+        assert obs is not None
+        assert obs.median_tps == pytest.approx(45.3, rel=1e-6)
+        warmup_calls = [
+            c for c in fake_runner.calls
+            if "-r" in c and c[c.index("-r") + 1] == "1"
+        ]
+        assert len(warmup_calls) == 1
+        actual_warmup = warmup_calls[0]
+        pairs = dict(zip(actual_warmup[1::2], actual_warmup[2::2]))
+        assert pairs.get("--split-mode") == "none"
+        assert pairs.get("--main-gpu") == "0"
