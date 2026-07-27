@@ -54,10 +54,12 @@ The TUI provides a four-screen workflow that guides you through session setup, r
 
 ### Workflow
 
-1. **Wizard** — fill in the llama-bench path, model path, journal path, optional MTP draft/server paths, device selection, context composition, search profile and objective, and resource budget overrides. Use Tab/Shift+Tab to navigate, Enable MTP checkbox to reveal draft/server inputs.
-2. **Review** — review the complete session specification before starting. Press F10 or click Start to begin.
-3. **Progress** — live progress shows the current stage (setup, screening, validation, mtp_profile), candidate evaluations, dispositions, errors, and warnings. Press Esc or Ctrl+C to cancel.
-4. **Results** — read-only tabs for Markdown report, preset.ini, and shell commands. Uses existing `Application.export_report_markdown` and reporter builders.
+1. **Wizard** — fill in the llama-bench path, model path, journal path, optional MTP draft/server paths, device selection, context composition, search profile and objective, and resource budget overrides. Use Tab/Shift+Tab to navigate, Enable MTP checkbox to reveal draft/server inputs. A visible **Quit (Ctrl+Q)** button exits immediately.
+2. **Review** — review the complete session specification before starting. Press F10 or click Start to begin. A visible **Quit (Ctrl+Q)** button exits immediately.
+3. **Progress** — live progress shows the current stage (setup, screening, validation, mtp_profile), candidate evaluations, dispositions, errors, and warnings. Press Esc or Ctrl+C to cancel, or press Ctrl+Q / click **Quit (Ctrl+Q)** to cancel the benchmark and close.
+4. **Results** — read-only tabs for Markdown report, preset.ini, and shell commands. Uses existing `Application.export_report_markdown` and reporter builders. Click **Quit (Esc)** to close.
+
+A visible **Quit** button is available on every screen. Press Ctrl+Q from any screen to exit. During a running benchmark, quitting requests cancellation before closing.
 
 ### Key bindings
 
@@ -67,6 +69,7 @@ The TUI provides a four-screen workflow that guides you through session setup, r
 | F10 | Wizard, Review | Next screen / Start |
 | Esc | Review, Progress | Back / Cancel |
 | Ctrl+C | Progress | Cancel benchmark |
+| Ctrl+Q | Any | Quit (visible button also present) |
 | F3 | Results | Copy Markdown to clipboard |
 | F4 | Results | Copy preset.ini to clipboard |
 | F5 | Results | Copy shell commands to clipboard |

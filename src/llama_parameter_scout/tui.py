@@ -281,7 +281,7 @@ class ScoutTuiApp(App[None]):
     #error-screen { align: center middle; }
     """
     BINDINGS = [
-        Binding("ctrl+q", "exit", "Quit"),
+        Binding("ctrl+q", "quit", "Quit"),
     ]
 
     wizard_state: WizardState
@@ -422,6 +422,7 @@ class WizardScreen(Screen[ScoutTuiApp]):
             yield Label("", id="wizard_errors")
             yield Horizontal(
                 Button("Review & Start", id="next_btn", variant="primary"),
+                Button("Quit (Ctrl+Q)", id="quit_btn"),
                 classes="button-row",
             )
 
@@ -467,6 +468,10 @@ class WizardScreen(Screen[ScoutTuiApp]):
     @on(Button.Pressed, "#next_btn")
     def _on_next(self) -> None:
         self._do_next()
+
+    @on(Button.Pressed, "#quit_btn")
+    def action_quit(self) -> None:
+        self.app.exit()
 
     def _do_next(self) -> None:
         errors = self._gather_and_validate()
@@ -596,6 +601,7 @@ class ReviewScreen(Screen[ScoutTuiApp]):
             yield Horizontal(
                 Button("Back", id="back_btn"),
                 Button("Start Benchmark", id="start_btn", variant="primary", disabled=True),
+                Button("Quit (Ctrl+Q)", id="quit_btn"),
                 classes="button-row",
             )
 
@@ -769,6 +775,10 @@ class ReviewScreen(Screen[ScoutTuiApp]):
     def action_back(self) -> None:
         self.app.pop_screen()
 
+    @on(Button.Pressed, "#quit_btn")
+    def action_quit(self) -> None:
+        self.app.exit()
+
 
 # ── Progress screen ──────────────────────────────────────────────
 
@@ -777,6 +787,7 @@ class ProgressScreen(Screen[ScoutTuiApp]):
     BINDINGS = [
         Binding("escape", "cancel_run", "Cancel"),
         Binding("ctrl+c", "cancel_run", "Cancel"),
+        Binding("ctrl+q", "quit", "Quit"),
     ]
 
     def __init__(self) -> None:
@@ -792,7 +803,11 @@ class ProgressScreen(Screen[ScoutTuiApp]):
             yield Label("-- Benchmark in Progress --", id="progress-title")
             yield RichLog(id="progress-log", highlight=True, markup=True)
             yield Label("", id="progress-status")
-            yield Button("Cancel (Esc)", id="cancel_btn", variant="error")
+            yield Horizontal(
+                Button("Cancel (Esc)", id="cancel_btn", variant="error"),
+                Button("Quit (Ctrl+Q)", id="quit_btn"),
+                classes="button-row",
+            )
 
     def on_mount(self) -> None:
         self.run_benchmark()
@@ -802,6 +817,14 @@ class ProgressScreen(Screen[ScoutTuiApp]):
         self.post_message(RunProgress(ProgressEvent(
             stage="cancellation", message="Cancelling benchmark...",
         )))
+
+    def action_quit(self) -> None:
+        self._cancellation_event.set()
+        self.app.exit()
+
+    @on(Button.Pressed, "#quit_btn")
+    def _on_quit_pressed(self) -> None:
+        self.action_quit()
 
     @work(thread=True)
     def run_benchmark(self) -> None:
