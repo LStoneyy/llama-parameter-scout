@@ -28,19 +28,8 @@ Benchmark llama.cpp models across candidate configurations by driving `llama-ben
 
 ## Installation
 
-### via pipx (PyPI)
-
-```bash
-pipx install llama-parameter-scout
-llama-parameter-scout --help
-```
-
-### via uv tool (PyPI)
-
-```bash
-uv tool install llama-parameter-scout
-llama-parameter-scout --help
-```
+> **TODO:** Publish `llama-parameter-scout` to PyPI. Installation via `pipx` or
+> `uv tool install llama-parameter-scout` will be documented once the package is available.
 
 ### from source (development)
 
