@@ -34,6 +34,7 @@ htmlcov/
 
 # Logs and temporary files
 *.log
+/docs/ralph-logs/*.events.jsonl
 *.tmp
 *.temp
 *.swp
