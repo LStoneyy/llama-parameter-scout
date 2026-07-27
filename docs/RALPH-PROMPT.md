@@ -2,6 +2,11 @@ Inspect the latest commits, ./PRD.md, and ./issues/ to determine which issues
 are already implemented. Implement exactly the next unfinished issue -- exactly
 one issue per invocation.
 
+At the very start of this session, use the `todowrite` tool to create a concise
+todo list covering selection, implementation, review, verification, and commit.
+Keep the list up to date as you work. Mark at most one entry as `in_progress`
+at any time. Do not try to produce JSON output artificially.
+
 Where practical, use the skill tool to load and follow the `tdd` skill at seams
 already established or agreed in the spec, issue, architecture, or tests.
 
