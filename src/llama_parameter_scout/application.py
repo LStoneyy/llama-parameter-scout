@@ -57,7 +57,7 @@ from .runner import (
     ProcessStartError,
     ProductionProcessAdapter,
 )
-from .search import SCREENING_N_CTX, ScreeningEvaluator
+from .search import SCREENING_N_CTX, ScreeningEvaluator, generate_screening_grid
 from .search import screen as _search_screen
 from .toolchain import inspect_toolchain
 from .topology import DetectTopologyFn, detect_topology
@@ -155,11 +155,35 @@ def _build_argv(
         "-o", "json",
         "-r", str(repetitions),
     ]
+    if request.candidate.n_cpu_moe is not None:
+        argv.extend(["--n-cpu-moe", str(request.candidate.n_cpu_moe)])
     if session_spec is not None and not session_spec.cpu_only:
         if session_spec.selected_device_ids:
             argv.extend(["--split-mode", "none"])
             argv.extend(["--main-gpu", str(session_spec.selected_device_ids[0])])
     return argv
+
+
+_QUANTIZED_CACHE_TYPES = frozenset({"q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "q6_k", "q8_k"})
+
+_FLASH_INCOMPATIBLE_CACHE_TYPES = frozenset({"q8_0", "q4_0", "q4_1", "q5_0", "q5_1"})
+
+
+def _is_quantized_cache(ctype: str) -> bool:
+    return ctype.lower() in _QUANTIZED_CACHE_TYPES
+
+
+def _provenance_for(candidate: CandidateConfig) -> str:
+    parts: list[str] = []
+    if candidate.flash_attn:
+        parts.append("flash_attn=enabled")
+    if candidate.cache_type_k != "f16" or candidate.cache_type_v != "f16":
+        parts.append(f"cache_k={candidate.cache_type_k},cache_v={candidate.cache_type_v}")
+    if candidate.n_cpu_moe is not None:
+        parts.append(f"n_cpu_moe={candidate.n_cpu_moe}")
+    if candidate.n_gpu_layers != 0:
+        parts.append(f"n_gpu_layers={candidate.n_gpu_layers}")
+    return "; ".join(parts) if parts else "defaults"
 
 
 def _validate_request(request: SingleRunRequest) -> None:
@@ -872,6 +896,74 @@ def _screening_preflight(
     model: ModelFingerprint,
     session_spec: SessionSpecification | None,
 ) -> ScreeningResult | None:
+    cc = request.candidate
+
+    if cc.flash_attn and "-fa" not in toolchain.supported_flags:
+        return ScreeningResult(
+            candidate=cc, success=False,
+            disposition="unsupported",
+            reason="flash_attn requested but toolchain does not support '-fa' flag.",
+            provenance="flash_attn=unsupported",
+        )
+
+    if cc.flash_attn:
+        if cc.cache_type_k.lower() in _FLASH_INCOMPATIBLE_CACHE_TYPES:
+            return ScreeningResult(
+                candidate=cc, success=False,
+                disposition="pruned",
+                reason=f"flash_attn is incompatible with cache_type_k='{cc.cache_type_k}'.",
+                provenance=f"flash_attn + cache_k={cc.cache_type_k}=incompatible",
+            )
+        if cc.cache_type_v.lower() in _FLASH_INCOMPATIBLE_CACHE_TYPES:
+            return ScreeningResult(
+                candidate=cc, success=False,
+                disposition="pruned",
+                reason=f"flash_attn is incompatible with cache_type_v='{cc.cache_type_v}'.",
+                provenance=f"flash_attn + cache_v={cc.cache_type_v}=incompatible",
+            )
+
+    if toolchain.supported_cache_types:
+        if cc.cache_type_k not in toolchain.supported_cache_types:
+            return ScreeningResult(
+                candidate=cc, success=False,
+                disposition="unsupported",
+                reason=f"cache_type_k '{cc.cache_type_k}' not in toolchain supported types: "
+                       f"{', '.join(toolchain.supported_cache_types)}",
+                provenance=f"cache_k={cc.cache_type_k}=unsupported",
+            )
+        if cc.cache_type_v not in toolchain.supported_cache_types:
+            return ScreeningResult(
+                candidate=cc, success=False,
+                disposition="unsupported",
+                reason=f"cache_type_v '{cc.cache_type_v}' not in toolchain supported types: "
+                       f"{', '.join(toolchain.supported_cache_types)}",
+                provenance=f"cache_v={cc.cache_type_v}=unsupported",
+            )
+
+    if cc.n_cpu_moe is not None:
+        if not model.is_moe:
+            return ScreeningResult(
+                candidate=cc, success=False,
+                disposition="pruned",
+                reason="n_cpu_moe specified but model is not MoE.",
+                provenance="n_cpu_moe=not-moe",
+            )
+        if model.moe_expert_count is not None and cc.n_cpu_moe > model.moe_expert_count:
+            return ScreeningResult(
+                candidate=cc, success=False,
+                disposition="pruned",
+                reason=f"n_cpu_moe={cc.n_cpu_moe} exceeds model expert count "
+                       f"({model.moe_expert_count}).",
+                provenance=f"n_cpu_moe={cc.n_cpu_moe}>experts={model.moe_expert_count}",
+            )
+        if "--n-cpu-moe" not in toolchain.supported_flags:
+            return ScreeningResult(
+                candidate=cc, success=False,
+                disposition="unsupported",
+                reason="n_cpu_moe requested but toolchain does not support '--n-cpu-moe' flag.",
+                provenance="n_cpu_moe=unsupported",
+            )
+
     if session_spec is None:
         return None
 
@@ -1377,11 +1469,32 @@ class Application:
                 disposition_summary="Model fingerprint mismatch; no evaluations attempted",
             )
 
+        cpu_only = session_spec.cpu_only if session_spec is not None else False
+        expanded_grid = generate_screening_grid(
+            request.candidate, toolchain, model, cpu_only,
+        )
+
         def _production_evaluator(
             candidate: CandidateConfig,
             n_ctx: NctxComposition,
             repetitions: int,
         ) -> ScreeningResult:
+            preflight = _screening_preflight(
+                SingleRunRequest(
+                    binary_path=request.binary_path,
+                    model_path=request.model_path,
+                    journal_path=request.journal_path,
+                    n_ctx=request.n_ctx,
+                    candidate=candidate,
+                    binary_source=request.binary_source,
+                ),
+                toolchain,
+                model,
+                session_spec,
+            )
+            if preflight is not None:
+                return preflight
+
             pp_nctx = NctxComposition(
                 total=n_ctx.prompt + 2, prompt=n_ctx.prompt, generation=1, depth=1,
             )
@@ -1411,15 +1524,49 @@ class Application:
                     pp_samples=tuple(pp_result.observation.pp_samples),
                     tg_samples=tuple(tg_result.observation.tg_samples),
                 ),
+                provenance=_provenance_for(candidate),
             )
 
-        return _search_screen(
+        report = _search_screen(
             base_candidate=request.candidate,
             profile=profile,
             evaluator=_production_evaluator,
             screening_n_ctx=SCREENING_N_CTX,
             objective=objective,
+            grid=expanded_grid,
         )
+
+        notes: list[str] = []
+        for d in (
+            report.baseline_disposition,
+            *report.grid_dispositions,
+            *report.adaptive_dispositions,
+        ):
+            if d.success and d.observation is not None:
+                cc = d.candidate
+                if _is_quantized_cache(cc.cache_type_k) or _is_quantized_cache(cc.cache_type_v):
+                    msg = (
+                        f"Quantized KV cache type quality was not measured; "
+                        f"only throughput was assessed (K={cc.cache_type_k}, V={cc.cache_type_v})."
+                    )
+                    if msg not in notes:
+                        notes.append(msg)
+
+        if notes:
+            report = ScreeningReport(
+                profile=report.profile,
+                baseline_disposition=report.baseline_disposition,
+                grid_dispositions=report.grid_dispositions,
+                adaptive_dispositions=report.adaptive_dispositions,
+                survivors=report.survivors,
+                leader=report.leader,
+                attempts_used=report.attempts_used,
+                objective=report.objective,
+                disposition_summary=report.disposition_summary,
+                notes=tuple(notes),
+            )
+
+        return report
 
     def run(
         self,

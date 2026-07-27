@@ -228,6 +228,20 @@ def inspect_model(path: Path | str) -> ModelFingerprint:
                     diagnostics.append(f"Path appears to be on a network mount: {shard_path}")
                 network_mount_detected = True
 
+    is_moe = False
+    moe_expert_count: int | None = None
+    expert_count_key = f"{arch}.expert_count"
+    if expert_count_key in metadata:
+        ec = metadata[expert_count_key]
+        if isinstance(ec, (int, float)):
+            is_moe = True
+            moe_expert_count = int(ec)
+        else:
+            diagnostics.append(
+                f"{expert_count_key} has unexpected type {type(ec).__name__}, "
+                "treating as non-MoE",
+            )
+
     if len(shards) > 1:
         shard_ctx_values: set[int | None] = set()
         for s in shards:
@@ -257,6 +271,8 @@ def inspect_model(path: Path | str) -> ModelFingerprint:
         symlink_warning=symlink_warning,
         network_mount_detected=network_mount_detected,
         diagnostics=tuple(diagnostics),
+        is_moe=is_moe,
+        moe_expert_count=moe_expert_count,
     )
 
 

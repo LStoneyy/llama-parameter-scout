@@ -220,6 +220,7 @@ class CandidateConfig:
     flash_attn: bool
     cache_type_k: str
     cache_type_v: str
+    n_cpu_moe: int | None = None
 
 
 @dataclass(frozen=True)
@@ -253,6 +254,7 @@ class ToolchainFingerprint:
     supported_flags: tuple[str, ...]
     supported_output_formats: tuple[str, ...]
     device_capabilities: tuple[str, ...]
+    supported_cache_types: tuple[str, ...] = ("f16",)
 
 
 @dataclass(frozen=True)
@@ -274,6 +276,8 @@ class ModelFingerprint:
     symlink_warning: bool
     network_mount_detected: bool
     diagnostics: tuple[str, ...]
+    is_moe: bool = False
+    moe_expert_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -353,6 +357,7 @@ class ScreeningResult:
     disposition: ScreeningDisposition = "survived"
     reason: str = ""
     observation: ScreeningObservation | None = None
+    provenance: str = ""
 
 
 @dataclass(frozen=True)
@@ -393,3 +398,4 @@ class ScreeningReport:
     attempts_used: int = 0
     objective: str = "balanced"
     disposition_summary: str = ""
+    notes: tuple[str, ...] = ()
