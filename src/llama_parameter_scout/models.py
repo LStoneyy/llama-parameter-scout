@@ -298,6 +298,29 @@ class BenchmarkObservation:
     session_spec: SessionSpecification | None = None
 
 
+# ── Memory evidence model ─────────────────────────────────────────
+
+
+MemoryQuality = Literal["complete", "partial", "estimated", "incomparable"]
+
+
+@dataclass(frozen=True)
+class MemoryEvidence:
+    ram_bytes: int | None = None
+    vram_bytes: int | None = None
+    quality: MemoryQuality | None = None
+
+
+# ── Pareto frontier entry ─────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class ParetoEntry:
+    candidate: CandidateConfig
+    balanced: float
+    memory: MemoryEvidence
+
+
 # ── Search / Screening domain models ──────────────────────────────
 
 
@@ -348,6 +371,7 @@ class ScreeningObservation:
     pp_samples: tuple[float, ...]
     tg_samples: tuple[float, ...]
     memory_bytes: int | None = None
+    memory: MemoryEvidence | None = None
     observed_prompt: int | None = None
     observed_generation: int | None = None
     observed_depth: int | None = None
@@ -375,6 +399,7 @@ class RankedCandidate:
     pp_relative_dispersion: float
     tg_relative_dispersion: float
     memory_bytes: int | None = None
+    memory_evidence: MemoryEvidence | None = None
     total_repetitions: int = 0
     tie_break: str = ""
 
@@ -403,6 +428,7 @@ class ScreeningReport:
     objective: str = "balanced"
     disposition_summary: str = ""
     notes: tuple[str, ...] = ()
+    pareto_frontier: tuple[ParetoEntry, ...] = ()
 
 
 # ── Validation domain models ──────────────────────────────────────
@@ -429,6 +455,7 @@ class ValidatedCandidate:
     tg_median: float
     pp_relative_dispersion: float
     tg_relative_dispersion: float
+    memory_evidence: MemoryEvidence | None = None
     label: str = "Full-context validation - verified at requested context"
 
 
@@ -446,6 +473,7 @@ class ValidatedRecommendation:
     failures: tuple[FailedValidation, ...]
     attempts_used: int
     budget: int
+    pareto_frontier: tuple[ParetoEntry, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -454,3 +482,4 @@ class NoWinnerReport:
     failures: tuple[FailedValidation, ...]
     attempts_used: int
     budget: int
+    pareto_frontier: tuple[ParetoEntry, ...] = ()
