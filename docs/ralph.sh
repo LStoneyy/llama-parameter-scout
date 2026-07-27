@@ -11,7 +11,7 @@ set -Eeuo pipefail
 #
 # Optional environment variables:
 #   OPENCODE_BIN=opencode
-#   OPENCODE_COMMAND=implement  # set to an empty string to bypass --command
+#   OPENCODE_COMMAND=           # set to a custom command string to pass --command
 #   OPENCODE_AUTO=1             # set to 0 to disable --auto
 #   OPENCODE_MODEL=provider/model
 #   OPENCODE_AGENT=build
@@ -29,7 +29,7 @@ ISSUES_DIR="${SCRIPT_DIR}/issues"
 LOG_DIR="${SCRIPT_DIR}/ralph-logs"
 
 OPENCODE_BIN="${OPENCODE_BIN:-opencode}"
-OPENCODE_COMMAND="${OPENCODE_COMMAND-implement}"
+OPENCODE_COMMAND="${OPENCODE_COMMAND-}"
 OPENCODE_AUTO="${OPENCODE_AUTO:-1}"
 OPENCODE_MODEL="${OPENCODE_MODEL:-}"
 OPENCODE_AGENT="${OPENCODE_AGENT:-}"
@@ -154,7 +154,7 @@ while (( MAX_ITERATIONS == 0 || iteration <= MAX_ITERATIONS )); do
 ralph: OpenCode returned a generic server error.
 ralph: This log includes --print-logs with log level ${OPENCODE_LOG_LEVEL}.
 ralph: OpenCode also keeps native logs under ~/.local/share/opencode/log/ on macOS/Linux.
-ralph: To isolate the custom /implement command, run once with:
+ralph: To disable any explicitly configured custom --command for isolation, run once with:
 ralph:   OPENCODE_COMMAND= ./docs/ralph.sh 1
 ralph: To additionally isolate external plugins, run once with:
 ralph:   OPENCODE_COMMAND= OPENCODE_PURE=1 ./docs/ralph.sh 1
