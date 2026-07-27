@@ -11,6 +11,13 @@ VERSION_RE = re.compile(r"^version:\s*(\S+)", re.MULTILINE)
 BACKENDS_RE = re.compile(r"^backends:[ \t]*(.*)$", re.MULTILINE)
 OUTPUT_FORMATS_RE = re.compile(r"^supported_output_formats:[ \t]*(.*)$", re.MULTILINE)
 SUPPORTED_FLAGS_RE = re.compile(r"^supported_flags:[ \t]*(.*)$", re.MULTILINE)
+# Cache type information in --help output, e.g.:
+#   -ctk FNAME    ... (default: f16) {f16,f32,q8_0,q4_0}
+# or a dedicated line describing supported values.
+_CACHE_TYPE_HELP_RE = re.compile(
+    r"-(?:ctk|ctv)\b[^\n]*?\{([^}]+)\}",
+    re.MULTILINE | re.IGNORECASE,
+)
 
 
 def _platform_binary_names() -> list[str]:
@@ -50,14 +57,17 @@ def resolve_binary(
 def inspect_toolchain(
     runner: ProcessRunner,
     binary_path: Path,
+    help_output: str | None = None,
 ) -> ToolchainFingerprint:
     version_output = _run_version(runner, binary_path)
-    _run_help(runner, binary_path)
+    if help_output is None:
+        help_output = _run_help(runner, binary_path)
 
     version = _parse_version(version_output)
     backends = _parse_backends(version_output)
     output_formats = _parse_output_formats(version_output)
     supported_flags = _parse_supported_flags(version_output)
+    cache_types = _parse_cache_types(help_output, supported_flags)
 
     fp = ToolchainFingerprint(
         binary_path=binary_path,
@@ -65,6 +75,7 @@ def inspect_toolchain(
         supported_flags=tuple(supported_flags),
         supported_output_formats=tuple(output_formats),
         device_capabilities=tuple(backends),
+        supported_cache_types=tuple(cache_types),
     )
 
     _validate_required_flags(fp)
@@ -84,7 +95,7 @@ def _run_version(runner: ProcessRunner, binary_path: Path) -> str:
     return result.stdout
 
 
-def _run_help(runner: ProcessRunner, binary_path: Path) -> None:
+def _run_help(runner: ProcessRunner, binary_path: Path) -> str:
     result = runner.run([str(binary_path), "--help"])
     if result.returncode != 0:
         raise ToolchainError(
@@ -95,6 +106,7 @@ def _run_help(runner: ProcessRunner, binary_path: Path) -> None:
         raise ToolchainError(
             "llama-bench --help produced no output.",
         )
+    return result.stdout
 
 
 def _parse_version(output: str) -> str:
@@ -150,6 +162,20 @@ def _parse_supported_flags(output: str) -> list[str]:
             "Empty 'supported_flags:' line in llama-bench --version output.",
         )
     return [f.strip() for f in raw.split(",")]
+
+
+_DEFAULT_CACHE_TYPES = ("f16",)
+
+
+def _parse_cache_types(help_output: str, supported_flags: list[str]) -> list[str]:
+    if "-ctk" not in supported_flags and "-ctv" not in supported_flags:
+        return []
+    m = _CACHE_TYPE_HELP_RE.search(help_output)
+    if m is not None:
+        raw = m.group(1)
+        types = [t.strip() for t in raw.split(",")]
+        return [t for t in types if t.strip()]
+    return list(_DEFAULT_CACHE_TYPES)
 
 
 _REQUIRED_FLAGS = frozenset({

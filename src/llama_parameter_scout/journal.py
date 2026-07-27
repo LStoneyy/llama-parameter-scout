@@ -175,6 +175,7 @@ def _toolchain_to_dict(tc: ToolchainFingerprint) -> dict[str, object]:
         "supported_flags": list(tc.supported_flags),
         "supported_output_formats": list(tc.supported_output_formats),
         "device_capabilities": list(tc.device_capabilities),
+        "supported_cache_types": list(tc.supported_cache_types),
     }
 
 
@@ -188,7 +189,7 @@ def _shard_to_dict(s: ShardFingerprint) -> dict[str, object]:
 
 
 def _model_to_dict(m: ModelFingerprint) -> dict[str, object]:
-    return {
+    d: dict[str, object] = {
         "path": str(m.path),
         "architecture": m.architecture,
         "parameter_count": m.parameter_count,
@@ -199,3 +200,8 @@ def _model_to_dict(m: ModelFingerprint) -> dict[str, object]:
         "network_mount_detected": m.network_mount_detected,
         "diagnostics": list(m.diagnostics),
     }
+    if m.is_moe:
+        d["is_moe"] = True
+        if m.moe_expert_count is not None:
+            d["moe_expert_count"] = m.moe_expert_count
+    return d

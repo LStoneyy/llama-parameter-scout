@@ -126,6 +126,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=str,
         help="KV cache type for V (default: f16)",
     )
+    parser.add_argument(
+        "--n-cpu-moe",
+        type=int,
+        default=None,
+        help="Number of MoE experts to offload to CPU (MoE models only)",
+    )
 
     device_group = parser.add_mutually_exclusive_group(required=True)
     device_group.add_argument(
@@ -296,6 +302,7 @@ def main(argv: list[str] | None = None) -> None:
         flash_attn=args.flash_attn,
         cache_type_k=args.cache_type_k,
         cache_type_v=args.cache_type_v,
+        n_cpu_moe=args.n_cpu_moe,
     )
 
     runner = ProductionRunner()
@@ -390,6 +397,8 @@ def _print_toolchain_fingerprint(tc: ToolchainFingerprint, source: str) -> None:
         print(f"  Flags: {', '.join(tc.supported_flags)}")
     print(f"  Backends: {', '.join(tc.device_capabilities)}")
     print(f"  Output formats: {', '.join(tc.supported_output_formats)}")
+    if tc.supported_cache_types:
+        print(f"  Cache types: {', '.join(tc.supported_cache_types)}")
 
 
 def _print_model_fingerprint(m: ModelFingerprint) -> None:

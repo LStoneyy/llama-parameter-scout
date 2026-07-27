@@ -8,6 +8,7 @@ from typing import Protocol
 
 from .models import (
     CandidateConfig,
+    ModelFingerprint,
     NctxComposition,
     ProvisionalLeader,
     RankedCandidate,
@@ -15,6 +16,7 @@ from .models import (
     ScreeningReport,
     ScreeningResult,
     SearchProfile,
+    ToolchainFingerprint,
 )
 
 _SortKeyFn = Callable[[RankedCandidate], tuple[float, ...]]
@@ -99,6 +101,76 @@ def generate_core_grid(base: CandidateConfig) -> tuple[CandidateConfig, ...]:
                     cache_type_k=base.cache_type_k,
                     cache_type_v=base.cache_type_v,
                 ))
+    return tuple(grid)
+
+
+# ── Expanded screening grid ──────────────────────────────────────
+
+
+def _unique_sorted_vals(values: list[int]) -> list[int]:
+    seen: list[int] = []
+    for v in sorted(values):
+        if not seen or seen[-1] != v:
+            seen.append(v)
+    return seen
+
+
+def _n_gpu_layers_for_grid(base: CandidateConfig, cpu_only: bool) -> tuple[int, ...]:
+    if cpu_only:
+        return (0,)
+    vals = _unique_sorted_vals([0, base.n_gpu_layers])
+    return tuple(vals)
+
+
+def generate_screening_grid(
+    base: CandidateConfig,
+    toolchain: ToolchainFingerprint,
+    model: ModelFingerprint,
+    cpu_only: bool,
+) -> tuple[CandidateConfig, ...]:
+    ngl_values = _n_gpu_layers_for_grid(base, cpu_only)
+
+    fa_values: tuple[bool, ...]
+    if "-fa" in toolchain.supported_flags:
+        fa_values = (False, True)
+    else:
+        fa_values = (False,)
+
+    cache_types = toolchain.supported_cache_types or ("f16",)
+
+    if model.is_moe:
+        moe_values: tuple[int | None, ...] = (None, 0, 1)
+    else:
+        moe_values = (None,)
+
+    grid: list[CandidateConfig] = []
+    seen: set[CandidateConfig] = set()
+
+    core = generate_core_grid(base)
+    for c in core:
+        if c not in seen:
+            seen.add(c)
+            grid.append(c)
+
+    for ngl in ngl_values:
+        for fa in fa_values:
+            for ck in cache_types:
+                for cv in cache_types:
+                    for moe in moe_values:
+                        c = CandidateConfig(
+                            threads=base.threads,
+                            batch_size=base.batch_size,
+                            ubatch_size=base.ubatch_size,
+                            n_gpu_layers=ngl,
+                            flash_attn=fa,
+                            cache_type_k=ck,
+                            cache_type_v=cv,
+                            n_cpu_moe=moe,
+                        )
+                        if c not in seen:
+                            seen.add(c)
+                            grid.append(c)
+
     return tuple(grid)
 
 
@@ -498,6 +570,7 @@ def screen(
     evaluator: ScreeningEvaluator,
     screening_n_ctx: NctxComposition,
     objective: str = "balanced",
+    grid: tuple[CandidateConfig, ...] | None = None,
 ) -> ScreeningReport:
     if objective not in ("pp", "tg", "balanced"):
         raise ValueError(f"Objective must be 'pp', 'tg', or 'balanced', got {objective!r}")
@@ -543,7 +616,7 @@ def screen(
             disposition_summary="Baseline produced non-positive PP or TG",
         )
 
-    grid = generate_core_grid(base_candidate)
+    grid = grid if grid is not None else generate_core_grid(base_candidate)
 
     survivor_observations: list[tuple[CandidateConfig, list[ScreeningObservation]]] = []
     grid_dispositions: list[ScreeningResult] = []
@@ -555,6 +628,7 @@ def screen(
                 candidate=candidate, success=True,
                 disposition="matches_baseline",
                 reason="Baseline candidate; not re-evaluated",
+                provenance=baseline_result.provenance,
             ))
             continue
 
@@ -582,6 +656,7 @@ def screen(
                 candidate=candidate, success=True,
                 disposition="survived", observation=result.observation,
                 reason="Completed screening run",
+                provenance=result.provenance,
             ))
         else:
             grid_dispositions.append(result)
@@ -636,6 +711,7 @@ def screen(
                     disposition="dominance_pruned", observation=d.observation,
                     reason=f"Dominated by another survivor in both PP and TG; "
                            f"PP={rc.pp_score:.4f} TG={rc.tg_score:.4f}",
+                    provenance=d.provenance,
                 )
                 break
 
