@@ -6,11 +6,24 @@ import math
 import os
 import subprocess
 import sys
+from collections import deque
 from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, cast
+from uuid import uuid4 as _uuid4
 
-from .journal import write_observation, write_outcome
+from .journal import (
+    list_sessions as _journal_list_sessions,
+)
+from .journal import (
+    read_journal_events,
+    write_measurement_completed,
+    write_observation,
+    write_outcome,
+    write_search_decision,
+    write_session_start,
+)
 from .model_inspector import inspect_model
 from .models import (
     BenchmarkObservation,
@@ -28,6 +41,7 @@ from .models import (
     InvalidNctxError,
     JournalError,
     MalformedOutputError,
+    MemoryEvidence,
     ModelFingerprint,
     ModelFingerprintMismatchError,
     ModelNotFoundError,
@@ -43,8 +57,10 @@ from .models import (
     ScreeningReport,
     ScreeningResult,
     SearchProfile,
+    SessionResumeResult,
     SessionSetupError,
     SessionSpecification,
+    ShardFingerprint,
     SingleRunRequest,
     SubprocessError,
     SystemTopology,
@@ -1220,6 +1236,102 @@ class Application:
         )
         return spec
 
+    def start_or_resume_session(
+        self,
+        journal_path: Path,
+        spec: SessionSpecification,
+        model: ModelFingerprint,
+        candidate: CandidateConfig | None = None,
+        profile: SearchProfile | None = None,
+        objective: str = "balanced",
+        toolchain: ToolchainFingerprint | None = None,
+    ) -> SessionResumeResult:
+        components, digest = _compute_full_fingerprint_components(
+            spec, model, candidate=candidate, profile=profile,
+            objective=objective, toolchain=toolchain,
+        )
+        events = read_journal_events(journal_path)
+        session_id = _uuid4().hex
+        parent_session_id: str | None = None
+        mismatch_reason: str | None = None
+
+        if not events:
+            write_session_start(journal_path, spec, session_id, None, components, digest)
+            return SessionResumeResult(action="new", session_id=session_id)
+
+        parent_session_id = None
+        observation: BenchmarkObservation | None = None
+
+        # Check if any v4 legacy or incompatible schema event exists
+        for ev in events:
+            if ev.get("session_id") == "v4-legacy":
+                parent_session_id = "v4-legacy"
+                mismatch_reason = "Incompatible legacy schema version"
+            if ev.get("event_type") == "incompatible_schema":
+                sid = ev.get("session_id", "")
+                if sid:
+                    parent_session_id = sid
+                    mismatch_reason = str(ev.get("reason", "Incompatible schema version"))
+
+        for ev in reversed(events):
+            if ev.get("event_type") != "session_start":
+                continue
+            stored_sid = ev.get("session_id", "")
+            stored_components = ev.get("fingerprint_components") or {}
+
+            if stored_components.get("schema_version") != CURRENT_SCHEMA_VERSION:
+                parent_session_id = stored_sid or "v4-legacy"
+                mismatch_reason = "Incompatible legacy schema version"
+                break
+
+            match_reason = _compare_fingerprint_components(stored_components, components)
+            if match_reason is not None:
+                parent_session_id = stored_sid
+                mismatch_reason = match_reason
+                break
+
+            stored_sid_match = stored_sid
+            for rev_ev in reversed(events):
+                if (rev_ev.get("event_type") == "observation_completed"
+                        and rev_ev.get("session_id") == stored_sid_match):
+                    obs_data = rev_ev.get("observation")
+                    if obs_data is not None and isinstance(obs_data, dict):
+                        obs_version = obs_data.get("version", 4)
+                        if obs_version == 4:
+                            observation = _dict_to_observation(obs_data)
+                    break
+
+            search_results: list[ScreeningResult] = []
+            for sr_ev in events:
+                if (sr_ev.get("event_type") in ("measurement_completed",)
+                        and sr_ev.get("session_id") == stored_sid_match):
+                    sr_data = sr_ev.get("screening_result")
+                    if sr_data is not None and isinstance(sr_data, dict):
+                        try:
+                            sr = _dict_to_screening_result(sr_data)
+                            if sr is not None:
+                                search_results.append(sr)
+                        except Exception:
+                            pass
+
+            return SessionResumeResult(
+                action="resumed",
+                session_id=stored_sid_match,
+                observation=observation,
+                completed_search_results=tuple(search_results),
+            )
+
+        write_session_start(
+            journal_path, spec, session_id, parent_session_id, components, digest,
+            reason=mismatch_reason,
+        )
+        return SessionResumeResult(
+            action="derived",
+            session_id=session_id,
+            parent_session_id=parent_session_id,
+            mismatch_reason=mismatch_reason or "unknown",
+        )
+
     def evaluate_candidate(
         self,
         request: SingleRunRequest,
@@ -1227,6 +1339,7 @@ class Application:
         on_ready: Callable[[ToolchainFingerprint, ModelFingerprint], Any] | None = None,
         session_spec: SessionSpecification | None = None,
         policy: ExecutionPolicy | None = None,
+        session_id: str | None = None,
     ) -> CandidateOutcome:
         try:
             _validate_request(request)
@@ -1238,7 +1351,10 @@ class Application:
                 diagnostic=str(e),
                 safe_next_action=_NEXT_ACTION["unsupported"],
             )
-            _journal_outcome(request.journal_path, outcome, session_spec=session_spec)
+            _journal_outcome(
+                request.journal_path, outcome,
+                session_spec=session_spec, session_id=session_id,
+            )
             return outcome
 
         try:
@@ -1251,7 +1367,10 @@ class Application:
                 diagnostic=str(e),
                 safe_next_action=_NEXT_ACTION["unsupported"],
             )
-            _journal_outcome(request.journal_path, outcome, session_spec=session_spec)
+            _journal_outcome(
+                request.journal_path, outcome,
+                session_spec=session_spec, session_id=session_id,
+            )
             return outcome
 
         try:
@@ -1264,7 +1383,10 @@ class Application:
                 diagnostic=str(e),
                 safe_next_action=_NEXT_ACTION["unsupported"],
             )
-            _journal_outcome(request.journal_path, outcome, session_spec=session_spec)
+            _journal_outcome(
+                request.journal_path, outcome,
+                session_spec=session_spec, session_id=session_id,
+            )
             return outcome
 
         if on_ready is not None:
@@ -1282,7 +1404,10 @@ class Application:
                     ),
                     safe_next_action=_NEXT_ACTION["unsupported"],
                 )
-                _journal_outcome(request.journal_path, outcome, session_spec=session_spec)
+                _journal_outcome(
+                    request.journal_path, outcome,
+                    session_spec=session_spec, session_id=session_id,
+                )
                 return outcome
             if session_spec.model != model:
                 outcome = CandidateOutcome(
@@ -1295,7 +1420,10 @@ class Application:
                     ),
                     safe_next_action=_NEXT_ACTION["unsupported"],
                 )
-                _journal_outcome(request.journal_path, outcome, session_spec=session_spec)
+                _journal_outcome(
+                    request.journal_path, outcome,
+                    session_spec=session_spec, session_id=session_id,
+                )
                 return outcome
             try:
                 _validate_ngl_consistency(
@@ -1310,7 +1438,10 @@ class Application:
                     diagnostic=str(e),
                     safe_next_action=_NEXT_ACTION["pruned"],
                 )
-                _journal_outcome(request.journal_path, outcome, session_spec=session_spec)
+                _journal_outcome(
+                    request.journal_path, outcome,
+                    session_spec=session_spec, session_id=session_id,
+                )
                 return outcome
 
             if not session_spec.cpu_only:
@@ -1326,7 +1457,10 @@ class Application:
                         ),
                         safe_next_action=_NEXT_ACTION["unsupported"],
                     )
-                    _journal_outcome(request.journal_path, outcome, session_spec=session_spec)
+                    _journal_outcome(
+                        request.journal_path, outcome,
+                        session_spec=session_spec, session_id=session_id,
+                    )
                     return outcome
 
                 device_id = session_spec.selected_device_ids[0]
@@ -1348,12 +1482,18 @@ class Application:
                             ),
                             safe_next_action=_NEXT_ACTION["unsupported"],
                         )
-                        _journal_outcome(request.journal_path, outcome, session_spec=session_spec)
+                        _journal_outcome(
+                            request.journal_path, outcome,
+                            session_spec=session_spec, session_id=session_id,
+                        )
                         return outcome
 
         pre_outcome = pre_execution_disposition(request, session_spec)
         if pre_outcome is not None:
-            _journal_outcome(request.journal_path, pre_outcome, session_spec=session_spec)
+            _journal_outcome(
+                request.journal_path, pre_outcome,
+                session_spec=session_spec, session_id=session_id,
+            )
             return pre_outcome
 
         warmup_argv = _build_argv(request, repetitions=1, session_spec=session_spec)
@@ -1362,7 +1502,10 @@ class Application:
         )
         if warmup_outcome.disposition != "completed":
             try:
-                _journal_outcome(request.journal_path, warmup_outcome, session_spec=session_spec)
+                _journal_outcome(
+                    request.journal_path, warmup_outcome,
+                    session_spec=session_spec, session_id=session_id,
+                )
             except JournalError as e:
                 return CandidateOutcome(
                     candidate=request.candidate,
@@ -1386,6 +1529,7 @@ class Application:
                     request.journal_path,
                     measure_outcome.observation,
                     session_spec=session_spec,
+                    session_id=session_id,
                 )
             except OSError as e:
                 outcome = CandidateOutcome(
@@ -1398,7 +1542,10 @@ class Application:
                 return outcome
         else:
             try:
-                write_outcome(request.journal_path, measure_outcome, session_spec=session_spec)
+                write_outcome(
+                    request.journal_path, measure_outcome,
+                    session_spec=session_spec, session_id=session_id,
+                )
             except OSError as e:
                 return CandidateOutcome(
                     candidate=request.candidate,
@@ -1419,35 +1566,85 @@ class Application:
         session_spec: SessionSpecification | None = None,
         policy: ExecutionPolicy | None = None,
         objective: str = "balanced",
+        session_id: str | None = None,
+        parent_session_id: str | None = None,
+        completed_search_results: tuple[ScreeningResult, ...] = (),
     ) -> ScreeningReport:
         _validate_request(request)
 
+        prior_by_candidate: dict[CandidateConfig, deque[ScreeningResult]] = {}
+        for r in completed_search_results:
+            if r.candidate not in prior_by_candidate:
+                prior_by_candidate[r.candidate] = deque()
+            prior_by_candidate[r.candidate].append(r)
+
+        def _wrap_for_prior_and_journal(
+            inner: ScreeningEvaluator,
+        ) -> ScreeningEvaluator:
+            def wrapped(
+                candidate: CandidateConfig,
+                n_ctx: NctxComposition,
+                repetitions: int,
+            ) -> ScreeningResult:
+                if candidate in prior_by_candidate and prior_by_candidate[candidate]:
+                    return prior_by_candidate[candidate].popleft()
+                result = inner(candidate, n_ctx, repetitions)
+                if session_id is not None:
+                    try:
+                        write_measurement_completed(
+                            request.journal_path, result, session_id,
+                            parent_session_id=parent_session_id,
+                        )
+                    except OSError as e:
+                        raise JournalError(
+                            f"Failed to write measurement_completed journal: {e}",
+                        ) from e
+                return result
+            return wrapped
+
         if evaluator is not None:
+            wrapped = _wrap_for_prior_and_journal(evaluator)
             inj_budget = session_spec.budget if session_spec is not None else None
             inj_memory_unified = (
                 session_spec.topology.memory_unified
                 if session_spec is not None else False
             )
-            return _search_screen(
+            report = _search_screen(
                 base_candidate=request.candidate,
                 profile=profile,
-                evaluator=evaluator,
+                evaluator=wrapped,
                 screening_n_ctx=SCREENING_N_CTX,
                 objective=objective,
                 resource_budget=inj_budget,
                 memory_unified=inj_memory_unified,
             )
+            if session_id is not None:
+                _journal_search_decisions(
+                    request.journal_path, report, session_id,
+                    parent_session_id=parent_session_id,
+                )
+            return report
 
         # Inspect toolchain and model once, before the search.
         try:
             toolchain = inspect_toolchain(self._runner, request.binary_path)
         except ScoutError as e:
+            baseline = ScreeningResult(
+                candidate=request.candidate, success=False,
+                disposition="unsupported", reason=str(e),
+            )
+            if session_id is not None:
+                write_search_decision(
+                    request.journal_path,
+                    candidate=asdict(baseline.candidate),
+                    disposition=baseline.disposition,
+                    reason=baseline.reason,
+                    session_id=session_id,
+                    parent_session_id=parent_session_id,
+                )
             return ScreeningReport(
                 profile=profile,
-                baseline_disposition=ScreeningResult(
-                    candidate=request.candidate, success=False,
-                    disposition="unsupported", reason=str(e),
-                ),
+                baseline_disposition=baseline,
                 grid_dispositions=(),
                 survivors=(),
                 leader=None,
@@ -1459,12 +1656,22 @@ class Application:
         try:
             model = inspect_model(request.model_path)
         except ScoutError as e:
+            baseline = ScreeningResult(
+                candidate=request.candidate, success=False,
+                disposition="unsupported", reason=str(e),
+            )
+            if session_id is not None:
+                write_search_decision(
+                    request.journal_path,
+                    candidate=asdict(baseline.candidate),
+                    disposition=baseline.disposition,
+                    reason=baseline.reason,
+                    session_id=session_id,
+                    parent_session_id=parent_session_id,
+                )
             return ScreeningReport(
                 profile=profile,
-                baseline_disposition=ScreeningResult(
-                    candidate=request.candidate, success=False,
-                    disposition="unsupported", reason=str(e),
-                ),
+                baseline_disposition=baseline,
                 grid_dispositions=(),
                 survivors=(),
                 leader=None,
@@ -1474,13 +1681,23 @@ class Application:
             )
 
         if session_spec is not None and session_spec.model != model:
+            baseline = ScreeningResult(
+                candidate=request.candidate, success=False,
+                disposition="unsupported",
+                reason="Session spec model fingerprint does not match freshly inspected model.",
+            )
+            if session_id is not None:
+                write_search_decision(
+                    request.journal_path,
+                    candidate=asdict(baseline.candidate),
+                    disposition=baseline.disposition,
+                    reason=baseline.reason,
+                    session_id=session_id,
+                    parent_session_id=parent_session_id,
+                )
             return ScreeningReport(
                 profile=profile,
-                baseline_disposition=ScreeningResult(
-                    candidate=request.candidate, success=False,
-                    disposition="unsupported",
-                    reason="Session spec model fingerprint does not match freshly inspected model.",
-                ),
+                baseline_disposition=baseline,
                 grid_dispositions=(),
                 survivors=(),
                 leader=None,
@@ -1547,6 +1764,7 @@ class Application:
                 provenance=_provenance_for(candidate),
             )
 
+        wrapped_production = _wrap_for_prior_and_journal(_production_evaluator)
         budget = session_spec.budget if session_spec is not None else None
         memory_unified = (
             session_spec.topology.memory_unified
@@ -1556,7 +1774,7 @@ class Application:
         report = _search_screen(
             base_candidate=request.candidate,
             profile=profile,
-            evaluator=_production_evaluator,
+            evaluator=wrapped_production,
             screening_n_ctx=SCREENING_N_CTX,
             objective=objective,
             grid=expanded_grid,
@@ -1595,6 +1813,11 @@ class Application:
                 pareto_frontier=report.pareto_frontier,
             )
 
+        if session_id is not None:
+            _journal_search_decisions(
+                request.journal_path, report, session_id,
+                parent_session_id=parent_session_id,
+            )
         return report
 
     def validate_candidates(
@@ -1691,6 +1914,7 @@ class Application:
         *,
         on_ready: Callable[[ToolchainFingerprint, ModelFingerprint], Any] | None = None,
         session_spec: SessionSpecification | None = None,
+        session_id: str | None = None,
     ) -> BenchmarkObservation:
         _validate_request(request)
 
@@ -1786,7 +2010,10 @@ class Application:
         )
 
         try:
-            write_observation(request.journal_path, observation, session_spec=session_spec)
+            write_observation(
+                request.journal_path, observation,
+                session_spec=session_spec, session_id=session_id,
+            )
         except OSError as e:
             raise JournalError(f"Failed to write journal: {e}") from e
 
@@ -1971,11 +2198,103 @@ def _journal_outcome(
     path: Path,
     outcome: CandidateOutcome,
     session_spec: SessionSpecification | None = None,
+    session_id: str | None = None,
 ) -> None:
     try:
-        write_outcome(path, outcome, session_spec=session_spec)
+        write_outcome(path, outcome, session_spec=session_spec, session_id=session_id)
     except OSError as e:
         raise JournalError(f"Failed to write journal: {e}") from e
+
+
+def _dict_to_observation(d: dict[str, Any]) -> BenchmarkObservation:
+    obs_version = d.get("version", 4)
+    if obs_version != 4:
+        raise JournalError(f"Unsupported observation version: {obs_version}")
+    cand = CandidateConfig(**d.get("candidate", {}))
+    tc_data = d.get("toolchain", {})
+    tc = ToolchainFingerprint(
+        binary_path=Path(tc_data["binary_path"]) if tc_data.get("binary_path") else Path(),
+        version=tc_data.get("version", ""),
+        supported_flags=tuple(tc_data.get("supported_flags", [])),
+        supported_output_formats=tuple(tc_data.get("supported_output_formats", [])),
+        device_capabilities=tuple(tc_data.get("device_capabilities", [])),
+        supported_cache_types=tuple(tc_data.get("supported_cache_types", ("f16",))),
+    )
+    m_data = d.get("model", {})
+    shards = tuple(
+        ShardFingerprint(
+            path=Path(s["path"]),
+            size_bytes=s["size_bytes"],
+            modified_time=s["modified_time"],
+            digest_sha256=s["digest_sha256"],
+        )
+        for s in m_data.get("shards") or []
+    )
+    model = ModelFingerprint(
+        path=Path(m_data.get("path", "")),
+        architecture=m_data.get("architecture", ""),
+        parameter_count=m_data.get("parameter_count"),
+        context_length=m_data.get("context_length"),
+        quantization=m_data.get("quantization"),
+        shards=shards,
+        symlink_warning=m_data.get("symlink_warning", False),
+        network_mount_detected=m_data.get("network_mount_detected", False),
+        diagnostics=tuple(m_data.get("diagnostics") or []),
+        is_moe=m_data.get("is_moe", False),
+        moe_expert_count=m_data.get("moe_expert_count"),
+    )
+    return BenchmarkObservation(
+        candidate=cand,
+        total_ctx=d.get("total_ctx", 0),
+        prompt_ctx=d.get("prompt_ctx", 0),
+        generation_ctx=d.get("generation_ctx", 0),
+        depth_ctx=d.get("depth_ctx", 0),
+        samples_tps=tuple(d.get("samples_tps") or []),
+        median_tps=d.get("median_tps", 0.0),
+        dispersion_tps=d.get("dispersion_tps", 0.0),
+        binary_path=Path(d.get("binary_path", "")),
+        binary_source=d.get("binary_source", "explicit"),
+        model_path=Path(d.get("model_path", "")),
+        toolchain=tc,
+        model=model,
+    )
+
+
+def _dict_to_screening_result(d: dict[str, Any]) -> ScreeningResult | None:
+    version = d.get("version")
+    if version != 1:
+        return None
+    cand = CandidateConfig(**d.get("candidate", {}))
+    obs_data = d.get("observation")
+    obs: ScreeningObservation | None = None
+    if obs_data is not None and isinstance(obs_data, dict):
+        mem_data = obs_data.get("memory")
+        mem: MemoryEvidence | None = None
+        if mem_data is not None and isinstance(mem_data, dict):
+            mem = MemoryEvidence(
+                ram_bytes=mem_data.get("ram_bytes"),
+                vram_bytes=mem_data.get("vram_bytes"),
+                quality=mem_data.get("quality"),
+            )
+        obs = ScreeningObservation(
+            candidate=CandidateConfig(**obs_data.get("candidate", {})),
+            pp_samples=tuple(obs_data.get("pp_samples") or []),
+            tg_samples=tuple(obs_data.get("tg_samples") or []),
+            memory_bytes=obs_data.get("memory_bytes"),
+            memory=mem,
+            observed_prompt=obs_data.get("observed_prompt"),
+            observed_generation=obs_data.get("observed_generation"),
+            observed_depth=obs_data.get("observed_depth"),
+            observed_total=obs_data.get("observed_total"),
+        )
+    return ScreeningResult(
+        candidate=cand,
+        success=bool(d.get("success", False)),
+        disposition=d.get("disposition", "survived"),
+        reason=d.get("reason", ""),
+        observation=obs,
+        provenance=d.get("provenance", ""),
+    )
 
 
 def _validate_nctx_at_setup(n_ctx: NctxComposition) -> None:
@@ -1992,3 +2311,161 @@ def _validate_nctx_at_setup(n_ctx: NctxComposition) -> None:
             f"n_ctx components ({n_ctx.prompt} + {n_ctx.generation} + {n_ctx.depth}) "
             f"do not sum to total ({n_ctx.total})",
         )
+
+
+# ── Fingerprint v5: component families and comparison ────────────
+
+CURRENT_SCHEMA_VERSION = 5
+
+
+def _capture_environment() -> dict[str, str]:
+    relevant_keys = [
+        "CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES",
+    ]
+    env = {}
+    for key in relevant_keys:
+        val = os.environ.get(key)
+        if val is not None:
+            env[key] = val
+    return env
+
+
+def _compute_full_fingerprint_components(
+    spec: SessionSpecification,
+    model: ModelFingerprint,
+    candidate: CandidateConfig | None = None,
+    profile: SearchProfile | None = None,
+    objective: str = "balanced",
+    toolchain: ToolchainFingerprint | None = None,
+) -> tuple[dict[str, Any], str]:
+    components: dict[str, Any] = {
+        "schema_version": CURRENT_SCHEMA_VERSION,
+        "main_model": {
+            "path": str(model.path),
+            "architecture": model.architecture,
+            "parameter_count": model.parameter_count,
+            "context_length": model.context_length,
+            "quantization": model.quantization,
+            "shards": [
+                {
+                    "path": str(s.path),
+                    "size_bytes": s.size_bytes,
+                    "modified_time": s.modified_time,
+                    "digest_sha256": s.digest_sha256,
+                }
+                for s in model.shards
+            ],
+        },
+        "draft_model": None,
+        "topology": {
+            "cpu_count": spec.topology.cpu_count,
+            "system_memory_bytes": spec.topology.system_memory_bytes,
+            "memory_unified": spec.topology.memory_unified,
+            "accelerators": [
+                {
+                    "kind": a.kind,
+                    "backend": a.backend,
+                    "device_id": a.device_id,
+                    "description": a.description,
+                    "memory_bytes": a.memory_bytes,
+                }
+                for a in spec.topology.accelerators
+            ],
+        },
+        "device_selection": {
+            "cpu_only": spec.cpu_only,
+            "selected_device_ids": list(spec.selected_device_ids),
+        },
+        "context": {
+            "total": spec.n_ctx.total,
+            "prompt": spec.n_ctx.prompt,
+            "generation": spec.n_ctx.generation,
+            "depth": spec.n_ctx.depth,
+        },
+        "objective": objective,
+        "environment": _capture_environment(),
+        "budget": {
+            "ram_bytes": spec.budget.ram_bytes,
+            "vram_bytes": spec.budget.vram_bytes,
+            "headroom_ratio": spec.budget.headroom_ratio,
+        },
+    }
+    if toolchain is not None:
+        components["toolchain"] = {
+            "binary_path": str(toolchain.binary_path),
+            "version": toolchain.version,
+            "supported_flags": list(toolchain.supported_flags),
+            "supported_output_formats": list(toolchain.supported_output_formats),
+            "device_capabilities": list(toolchain.device_capabilities),
+            "supported_cache_types": list(toolchain.supported_cache_types),
+        }
+    if candidate is not None:
+        components["candidate"] = asdict(candidate)
+    if profile is not None:
+        components["profile"] = {
+            "label": profile.label,
+            "max_attempts": profile.max_attempts,
+            "min_repetitions": profile.min_repetitions,
+            "max_repetitions_per_candidate": profile.max_repetitions_per_candidate,
+            "tie_bound_coefficient": profile.tie_bound_coefficient,
+            "dispersion_threshold": profile.dispersion_threshold,
+        }
+    digest = hashlib.sha256(
+        _canonical_json(components).encode(),
+    ).hexdigest()
+    return components, digest
+
+
+_FINGERPRINT_FAMILIES: list[tuple[str, str]] = [
+    ("schema_version", "schema version"),
+    ("main_model", "model/shards"),
+    ("draft_model", "draft model"),
+    ("toolchain", "toolchain"),
+    ("topology", "topology/backend/device"),
+    ("device_selection", "device selection"),
+    ("context", "context"),
+    ("profile", "search profile"),
+    ("objective", "objective"),
+    ("environment", "environment"),
+    ("budget", "budget"),
+    ("candidate", "candidate"),
+]
+
+
+def _compare_fingerprint_components(stored: dict[str, Any], current: dict[str, Any]) -> str | None:
+    differences: list[str] = []
+    for key, label in _FINGERPRINT_FAMILIES:
+        if stored.get(key) != current.get(key):
+            differences.append(label)
+    if not differences:
+        return None
+    return f"Mismatch in: {', '.join(differences)}"
+
+
+def _journal_search_decisions(
+    journal_path: Path,
+    report: ScreeningReport,
+    session_id: str,
+    parent_session_id: str | None = None,
+) -> None:
+    all_results: list[ScreeningResult] = [
+        report.baseline_disposition,
+        *report.grid_dispositions,
+        *report.adaptive_dispositions,
+    ]
+    for r in all_results:
+        write_search_decision(
+            journal_path,
+            candidate=asdict(r.candidate),
+            disposition=r.disposition,
+            reason=r.reason,
+            session_id=session_id,
+            parent_session_id=parent_session_id,
+        )
+
+
+# ── Application session seam ─────────────────────────────────────
+
+
+def list_session_summaries(journal_path: Path) -> list[dict[str, Any]]:
+    return _journal_list_sessions(journal_path)

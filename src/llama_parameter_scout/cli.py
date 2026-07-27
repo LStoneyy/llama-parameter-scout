@@ -4,8 +4,9 @@ import argparse
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
-from .application import Application, make_memory_pressure_fn
+from .application import Application, list_session_summaries, make_memory_pressure_fn
 from .model_inspector import inspect_model
 from .models import (
     CandidateConfig,
@@ -14,12 +15,14 @@ from .models import (
     ContextExceededWithoutAcknowledgementError,
     ExecutionPolicy,
     InconsistentNglError,
+    JournalError,
     ModelFingerprint,
     MultipleAcceleratorsSelectedError,
     NctxComposition,
     NoAcceleratorSelectedError,
     ResourceBudget,
     ScoutError,
+    SearchProfile,
     SessionSetupError,
     SessionSpecification,
     SingleRunRequest,
@@ -27,6 +30,8 @@ from .models import (
     UnknownDeviceError,
 )
 from .runner import ProductionRunner
+from .search import get_profile
+from .toolchain import inspect_toolchain, resolve_binary
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -51,62 +56,72 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-path",
-        required=True,
+        required=False,
         type=Path,
+        default=None,
         help="Path to GGUF model file",
     )
     parser.add_argument(
         "--journal-path",
-        required=True,
+        required=False,
         type=Path,
+        default=None,
         help="Path to journal output file",
     )
     parser.add_argument(
         "--n-ctx",
-        required=True,
+        required=False,
         type=int,
+        default=None,
         help="Total context size (n_ctx = prompt + generation + depth)",
     )
     parser.add_argument(
         "--n-prompt",
-        required=True,
+        required=False,
         type=int,
+        default=None,
         help="Prompt token count",
     )
     parser.add_argument(
         "--n-generation",
-        required=True,
+        required=False,
         type=int,
+        default=None,
         help="Generation token count",
     )
     parser.add_argument(
         "--n-depth",
-        required=True,
+        required=False,
         type=int,
+        default=None,
         help="Depth token count passed to llama-bench",
     )
     parser.add_argument(
         "--threads",
-        required=True,
+        required=False,
         type=int,
+        default=None,
         help="Number of threads",
     )
     parser.add_argument(
         "--batch-size",
-        required=True,
+        required=False,
         type=int,
+        default=None,
         help="Batch size",
     )
     parser.add_argument(
         "--ubatch-size",
-        required=True,
+        required=False,
         type=int,
+        default=None,
         help="Micro-batch (ubatch) size",
     )
     parser.add_argument(
         "--n-gpu-layers",
-        required=True,
+        required=False,
         type=int,
+        default=None,
         help="Number of GPU layers (-1 = all)",
     )
     parser.add_argument(
@@ -133,7 +148,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Number of MoE experts to offload to CPU (MoE models only)",
     )
 
-    device_group = parser.add_mutually_exclusive_group(required=True)
+    device_group = parser.add_mutually_exclusive_group(required=False)
     device_group.add_argument(
         "--cpu-only",
         action="store_true",
@@ -169,6 +184,29 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=float,
         default=None,
         help="Maximum seconds for each candidate process launch (default: no timeout)",
+    )
+
+    # ── Session listing mode ─────────────────────────────────────
+    parser.add_argument(
+        "--list-sessions",
+        action="store_true",
+        help="List all known sessions in the journal and exit",
+    )
+
+    # ── Search profile and objective (for fingerprinting) ─────────
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default=None,
+        choices=("quick", "standard", "thorough"),
+        help="Search profile label (default: none; used for session fingerprint)",
+    )
+    parser.add_argument(
+        "--objective",
+        type=str,
+        default="balanced",
+        choices=("balanced", "pp", "tg", "memory"),
+        help="Search objective (default: balanced; used for session fingerprint)",
     )
     return parser.parse_args(argv)
 
@@ -274,11 +312,69 @@ def _prompt_confirmation(spec: SessionSpecification) -> bool:
         return False
 
 
+def _print_list_sessions(sessions: list[dict[str, Any]]) -> None:
+    if not sessions:
+        print("No sessions found.")
+        return
+    print("Known sessions:")
+    for s in sessions:
+        status = s.get("status", "unknown")
+        reason = s.get("reason", "")
+        sid = s.get("session_id", "?")
+        parent = s.get("parent_session_id")
+        line = f"  {sid}  [{status}]"
+        if parent and parent != "v4-legacy":
+            line += f"  parent: {parent}"
+        if reason:
+            line += f"  {reason}"
+        print(line)
+
+
+def _require_benchmark_args(args: argparse.Namespace) -> None:
+    required = [
+        ("--model-path", args.model_path),
+        ("--journal-path", args.journal_path),
+        ("--n-ctx", args.n_ctx),
+        ("--n-prompt", args.n_prompt),
+        ("--n-generation", args.n_generation),
+        ("--n-depth", args.n_depth),
+        ("--threads", args.threads),
+        ("--batch-size", args.batch_size),
+        ("--ubatch-size", args.ubatch_size),
+        ("--n-gpu-layers", args.n_gpu_layers),
+    ]
+    for name, val in required:
+        if val is None:
+            print(f"Error: {name} is required in benchmark mode", file=sys.stderr)
+            sys.exit(1)
+    if not args.cpu_only and args.device is None:
+        print(
+            "Error: either --cpu-only or --device is required in benchmark mode",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
 
+    # ── List-sessions mode ──────────────────────────────────────
+    if args.list_sessions:
+        jp = args.journal_path
+        if jp is None:
+            print("Error: --journal-path is required with --list-sessions", file=sys.stderr)
+            sys.exit(1)
+        try:
+            summaries = list_session_summaries(jp)
+        except JournalError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        _print_list_sessions(summaries)
+        sys.exit(0)
+
+    _require_benchmark_args(args)
+
     try:
-        from .toolchain import resolve_binary
         resolution = resolve_binary(
             llama_bench=args.binary_path,
             install_dir=args.install_dir,
@@ -306,6 +402,14 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     runner = ProductionRunner()
+
+    toolchain: ToolchainFingerprint | None = None
+    try:
+        toolchain = inspect_toolchain(runner, resolution.binary_path)
+    except ScoutError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
     app = Application(runner)
 
     try:
@@ -366,6 +470,53 @@ def main(argv: list[str] | None = None) -> None:
         binary_source=resolution.source,
     )
 
+    # ── Resolve profile from --profile flag ─────────────────────
+    profile: SearchProfile | None = None
+    if args.profile is not None:
+        try:
+            profile = get_profile(args.profile)
+        except ValueError:
+            pass
+
+    # ── Session seam: start / resume / derive ──────────────────
+    try:
+        session_result = app.start_or_resume_session(
+            journal_path=request.journal_path,
+            spec=spec,
+            model=model,
+            candidate=candidate,
+            profile=profile,
+            objective=args.objective,
+            toolchain=toolchain,
+        )
+    except JournalError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    obs = session_result.observation
+    if session_result.action == "resumed" and obs is not None:
+        print(f"Resumed session {session_result.session_id} — exact fingerprint match.")
+        print("\nWarmup complete.")
+        print(f"Measurements: {len(obs.samples_tps)} repetitions")
+        print(f"Median throughput: {obs.median_tps:.2f} t/s")
+        print(f"Dispersion (population stddev): {obs.dispersion_tps:.2f} t/s")
+        print(f"Journal: {request.journal_path}")
+        return
+
+    if session_result.action == "resumed":
+        print(
+            f"Resumed incomplete session {session_result.session_id} "
+            f"— exact fingerprint match; proceeding to measurement."
+        )
+    elif session_result.action == "derived":
+        print(
+            f"Derived session {session_result.session_id} "
+            f"from {session_result.parent_session_id} — "
+            f"{session_result.mismatch_reason}."
+        )
+    else:
+        print(f"New session {session_result.session_id}.")
+
     memory_pressure_fn = make_memory_pressure_fn(spec) if spec is not None else None
     policy = ExecutionPolicy(
         candidate_timeout_seconds=args.candidate_timeout,
@@ -381,6 +532,7 @@ def main(argv: list[str] | None = None) -> None:
         on_ready=_on_ready,
         session_spec=spec,
         policy=policy,
+        session_id=session_result.session_id,
     )
 
     _print_outcome(outcome, journal_path=request.journal_path)

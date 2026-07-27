@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import struct
 from pathlib import Path
 
@@ -277,7 +278,7 @@ class TestMain:
             ])
         assert exc.value.code == 1
         captured = capsys.readouterr()
-        assert "Disposition: unsupported" in captured.out
+        assert "Error:" in captured.err
 
     def test_success_output(
         self,
@@ -331,15 +332,18 @@ class TestMain:
         assert "Resource Budget:" in captured.out
         assert "Context Advisory:" in captured.out
         assert "Fingerprint:" in captured.out
+        assert "New session" in captured.out
         assert "Warmup complete" in captured.out
         assert "Measurements: 3 repetitions" in captured.out
         assert "Median throughput:" in captured.out
         assert "Journal:" in captured.out
 
         assert jp.exists()
-        import json
         data = json.loads(jp.read_text())
-        assert data["version"] == 4
+        assert data["schema_version"] == 5
+        assert len(data["events"]) == 2
+        assert data["events"][0]["event_type"] == "session_start"
+        assert data["events"][1]["event_type"] == "observation_completed"
 
     def test_success_with_install_dir(
         self,
@@ -419,9 +423,9 @@ class TestMain:
             "--cpu-only",
             "--yes",
         ])
-        import json
         data = json.loads(jp.read_text())
-        assert data["toolchain"]["supported_flags"] == [
+        obs = data["events"][1]["observation"]
+        assert obs["toolchain"]["supported_flags"] == [
             "-m", "-p", "-n", "-d", "-t", "-b", "-ub",
             "-ngl", "-fa", "-ctk", "-ctv", "-o", "-r",
         ]
@@ -474,8 +478,10 @@ class TestMain:
         assert "Version: path_test" in captured.out
 
     def test_missing_required_arg(self) -> None:
+        from llama_parameter_scout.cli import _require_benchmark_args
+        ns = _parse_args(["--list-sessions", "--journal-path", "/tmp/x.json"])
         with pytest.raises(SystemExit):
-            _parse_args(["--llama-bench", "/x"])
+            _require_benchmark_args(ns)
 
     def test_cpu_only_on_host_without_gpu(
         self,
@@ -552,10 +558,8 @@ class TestMain:
             "--cpu-only",
             "--yes",
         ])
-        import json
         data = json.loads(jp.read_text())
-        assert "session_spec" in data
-        ss = data["session_spec"]
+        ss = data["events"][0]["session_spec"]
         assert ss["cpu_only"] is True
         assert ss["selected_device_ids"] == []
         assert ss["n_ctx"]["total"] == 1
@@ -604,9 +608,8 @@ class TestMain:
             "--budget-ram", "8589934592",
             "--yes",
         ])
-        import json
         data = json.loads(jp.read_text())
-        budget = data["session_spec"]["budget"]
+        budget = data["events"][0]["session_spec"]["budget"]
         assert budget["ram_bytes"] == 8589934592
 
     def test_context_above_training_length_warning_output(
@@ -652,3 +655,50 @@ class TestMain:
         assert "Session Specification:" in captured.out
         assert "Acknowledged: True" in captured.out
         assert "Fingerprint:" in captured.out
+
+    def test_corrupt_journal_in_benchmark_mode(
+        self,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        bp = tmp_path / "llama-bench"
+        bp.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "--version" ]; then\n'
+            '  echo "version: test123"\n'
+            '  echo "backends: cpu,metal"\n'
+            '  echo "supported_flags: -m,-p,-n,-d,-t,-b,-ub,-ngl,-fa,-ctk,-ctv,-o,-r"\n'
+            '  echo "supported_output_formats: json,jsonl"\n'
+            "elif [ \"$1\" = \"--help\" ]; then\n"
+            '  echo "usage: llama-bench"\n'
+            "else\n"
+            '  echo \'[{"samples_ts":[10.0,11.0,12.0]}]\'\n'
+            "fi\n",
+        )
+        bp.chmod(0o755)
+        mp = tmp_path / "model.gguf"
+        _make_gguf(mp)
+        jp = tmp_path / "journal.json"
+        jp.write_text("{corrupt json")
+
+        with pytest.raises(SystemExit) as exc:
+            main([
+                "--llama-bench", str(bp),
+                "--model-path", str(mp),
+                "--journal-path", str(jp),
+                "--n-ctx", "2048",
+                "--n-prompt", "512",
+                "--n-generation", "1024",
+                "--n-depth", "512",
+                "--threads", "4",
+                "--batch-size", "512",
+                "--ubatch-size", "512",
+                "--n-gpu-layers", "0",
+                "--cpu-only",
+                "--yes",
+            ])
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        assert "Error:" in captured.err
+        assert "Traceback" not in captured.err
+        assert jp.read_text() == "{corrupt json"

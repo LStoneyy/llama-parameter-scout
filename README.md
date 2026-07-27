@@ -2,8 +2,9 @@
 
 Benchmark llama.cpp models across candidate configurations by driving `llama-bench` with explicit settings, collecting throughput samples, and journaling results.
 
-> **Status:** issue 08 - resource-budget recommendations with memory objective.
-> No resume, TUI, or MTP yet.
+> **Status:** issue 09 — resume or derive benchmark sessions with
+> fingerprint-based exact-match reuse and CLI session listing.
+> No TUI or MTP yet.
 
 ## Setup
 
@@ -95,7 +96,7 @@ Default budgets use the detected system memory (and zero VRAM for discrete GPUs)
 6. **Warmup:** one `llama-bench` invocation (`-r 1`), output validated as parseable JSON/JSONL.
 7. **Measurement:** second `llama-bench` invocation (`-r 3`), output parsed for `samples_ts` (requires at least 3 finite positive throughput samples).
 8. **Statistics:** median throughput and population standard deviation (dispersion).
-9. **Atomic journal:** a versioned JSON file is written atomically (write-temp + fsync + `os.replace`).
+9. **Atomic journal (v5):** a schema-versioned JSON envelope with an ordered events list is written atomically (write-temp + fsync + `os.replace`). Each append preserves all prior committed events.
 10. **Terminal output:** session specification, toolchain fingerprint and model fingerprint printed before warmup, followed by measurement results and journal path.
 
 **Dispersion** is defined as the population standard deviation of the per-repetition throughput samples (tokens/second).
@@ -154,6 +155,8 @@ The advisory includes a note stating clearly that it is an estimate, not a teste
 ### Fingerprint
 
 The session specification fingerprint is a SHA-256 hash of the device selection, context composition, budget, and topology parameters. It is deterministic and included in the journal for reproducibility.
+
+The journal-level fingerprint (stored in `session_start` events) is a SHA-256 digest of an expanded component set covering toolchain, search profile, objective, environment, candidate config, and schema version for exact-match session resume.
 
 ## Search / Screening
 
@@ -433,6 +436,7 @@ uv run pytest tests/test_session.py -v
 uv run pytest tests/test_topology.py -v
 uv run pytest tests/test_application.py -v
 uv run pytest tests/test_cli.py -v
+uv run pytest tests/test_issue09.py -v
 
 # Type check
 uv run mypy src tests
@@ -453,85 +457,99 @@ MODEL_PATH=/path/to/model.gguf \
 
 The test is skipped unless both environment variables are set. It is excluded from the default `uv run pytest` run.
 
-## Journal schema
+## Journal schema (v5)
 
-Each successful run writes a versioned JSON document (version 4):
+Each run writes a v5 JSON envelope containing an ordered `events` collection:
 
 ```json
 {
-  "version": 4,
-  "candidate": {
-    "threads": 4,
-    "batch_size": 512,
-    "ubatch_size": 512,
-    "n_gpu_layers": 0,
-    "flash_attn": false,
-    "cache_type_k": "f16",
-    "cache_type_v": "f16",
-    "n_cpu_moe": null
-  },
-  "total_ctx": 2048,
-  "prompt_ctx": 512,
-  "generation_ctx": 1024,
-  "depth_ctx": 512,
-  "samples_tps": [45.5, 44.8, 45.3],
-  "median_tps": 45.3,
-  "dispersion_tps": 0.286,
-  "n_measurements": 3,
-  "binary_path": "/path/to/llama-bench",
-  "binary_source": "explicit",
-  "model_path": "/path/to/model.gguf",
-  "toolchain": {
-    "binary_path": "/path/to/llama-bench",
-    "version": "1234",
-    "supported_flags": ["-fa", "-ctk"],
-    "supported_output_formats": ["json"],
-    "device_capabilities": ["cpu", "metal"],
-    "supported_cache_types": ["f16", "f32", "q8_0"]
-  },
-  "model": {
-    "path": "/path/to/model.gguf",
-    "architecture": "llama",
-    "parameter_count": 7000000000,
-    "context_length": 4096,
-    "quantization": "Q4_K_M",
-    "shards": [],
-    "symlink_warning": false,
-    "network_mount_detected": false,
-    "diagnostics": [],
-    "is_moe": false
-  },
-  "session_spec": {
-    "cpu_only": false,
-    "selected_device_ids": [],
-    "n_ctx": {"total": 2048, "prompt": 512, "generation": 1024, "depth": 512},
-    "fingerprint": "abc123...",
-    "topology": {
-      "cpu_count": 8,
-      "system_memory_bytes": 17179869184,
-      "accelerators": [],
-      "memory_unified": false
+  "schema_version": 5,
+  "events": [
+    {
+      "event_type": "session_start",
+      "event_version": 1,
+      "session_id": "<uuid>",
+      "parent_session_id": null,
+      "timestamp": "2026-07-27T12:00:00",
+      "fingerprint_digest": "<sha256>",
+      "fingerprint_components": {
+        "schema_version": 5,
+        "main_model": { "architecture": "llama", "shard_digests": [], ... },
+        "draft_model": null,
+        "toolchain": { "binary_path": "...", "version": "1234", ... },
+        "topology": { "cpu_count": 8, "accelerators": [], ... },
+        "device_selection": { "cpu_only": true, "selected_device_ids": [] },
+        "context": { "total": 2048, "prompt": 512, "generation": 1024, "depth": 512 },
+        "profile": null,
+        "objective": "balanced",
+        "environment": {},
+        "budget": { "ram_bytes": 17179869184, "vram_bytes": null, "headroom_ratio": 0.1 },
+        "candidate": { "threads": 4, ... }
+      },
+      "session_spec": { ... }
     },
-    "budget": {
-      "ram_bytes": 17179869184,
-      "vram_bytes": null,
-      "headroom_ratio": 0.1
-    },
-    "advisory": {
-      "likely_fit_lower": 10000,
-      "likely_fit_upper": 20000,
-      "uncertain_maximum": 22000,
-      "model_weight_bytes": 4500000000,
-      "kv_cache_bytes_estimate": 500000000,
-      "note": "This is an estimate..."
+    {
+      "event_type": "observation_completed",
+      "event_version": 1,
+      "session_id": "<uuid>",
+      "parent_session_id": null,
+      "timestamp": "2026-07-27T12:05:00",
+      "observation": {
+        "disposition": "completed",
+        "candidate": { "threads": 4, ... },
+        "samples_tps": [45.5, 44.8, 45.3],
+        "toolchain": { ... },
+        "model": { ... }
+      }
     }
-  }
+  ]
 }
 ```
 
 `shards` contains one fingerprint entry per shard file path (with `size_bytes`, `modified_time`, `digest_sha256`) when the model is a split shard set; an empty array for a single file.
 
-`session_spec` is present when the run used session setup (default). It contains the full session specification, including the system topology, resource budget, context advisory, and fingerprint for provenance.
+Event types: `session_start`, `observation_completed`, `outcome_recorded`, `search_decision`.
+
+### Session resume / derive
+
+When a journal already exists, the application inspects the full fingerprint components to decide:
+
+- **Exact match:** fingerprint digest and all component families match → the session is **resumed**. No warmup or measurement is performed; the prior completed observation is reconstructed from the journal. CLI prints `Resumed session <id> — exact fingerprint match.`
+- **Any mismatch:** a new session ID is created, referencing the parent session. Each differing family (model, toolchain, topology, context, budget, etc.) produces a human-readable reason. CLI prints `Derived session <id> from <parent> — Mismatch in: <family>.`
+- **New journal:** a new session is started. CLI prints `New session <id>.`
+- **Legacy v4 journal:** classified as incompatible/historical; a new session is derived from it. The v4 content is preserved and never overwritten.
+
+### Fingerprint families
+
+The `fingerprint_components` dict covers all relevant dimensions for session identity:
+
+| Family | Contents |
+|--------|----------|
+| `schema_version` | Journal schema version |
+| `main_model` | Model path, architecture, parameter count, context length, quantization, shard digests |
+| `draft_model` | Reserved for future MTP; always `null` |
+| `toolchain` | Binary path, version, supported flags, device capabilities, cache types |
+| `topology` | CPU count, system memory, accelerators (kind/backend/device_id/description/memory) |
+| `device_selection` | `cpu_only`, `selected_device_ids` |
+| `context` | `total`, `prompt`, `generation`, `depth` of the n_ctx composition |
+| `profile` | Search profile label and parameters (present during screening) |
+| `objective` | Search objective (balanced, pp, tg, memory) |
+| `environment` | Relevant environment variables (e.g. `CUDA_VISIBLE_DEVICES`) |
+| `budget` | `ram_bytes`, `vram_bytes`, `headroom_ratio` |
+| `candidate` | Single-candidate `CandidateConfig` (present in explicit single-run mode) |
+
+### List sessions
+
+```bash
+uv run llama-parameter-scout --list-sessions --journal-path ./journal.json
+```
+```
+Known sessions:
+  <session_id>  [current]
+  v4-legacy  [historical]  Legacy v4 journal format — incompatible schema
+```
+
+`--list-sessions` does not require any benchmark arguments.
 
 ## Error handling
 
@@ -626,18 +644,20 @@ interruption. Cross-platform strategy:
 This containment is best-effort. The tool never promises absolute host isolation
 — child processes may still trigger host OOM or driver reset.
 
-### Journal schema (version 4)
+### Journal schema (v5 events)
 
-Every journal entry includes:
+Every journal event includes:
 
-- `"version": 4`
-- `"disposition"` — the candidate disposition string
-- `"process_launched"` — whether a child process was started
-- `"diagnostic"` — human-readable diagnostic details
-- `"safe_next_action"` — suggested next step
+- `"event_type"` — one of `session_start`, `observation_completed`, `outcome_recorded`, `search_decision`
+- `"event_version"` — version of the event schema
+- `"session_id"` — session identifier
+- `"parent_session_id"` — parent session (for derived sessions)
+- `"timestamp"` — UTC ISO-8601 timestamp
 
-Successful (`completed`) outcomes also include measurement data (`samples_tps`,
+`observation_completed` events contain measurement data (`samples_tps`,
 `median_tps`, `dispersion_tps`), toolchain fingerprint, and model fingerprint.
+`search_decision` events contain candidate, disposition, and reason for every
+screening decision made during candidate search.
 
 ### Repeated / systemic stop policy
 

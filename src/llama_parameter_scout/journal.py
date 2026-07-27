@@ -4,47 +4,102 @@ import json
 import os
 import tempfile
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+from uuid import uuid4 as _uuid4
 
 from .models import (
     Accelerator,
     BenchmarkObservation,
     CandidateOutcome,
     ContextAdvisory,
+    JournalError,
+    MemoryEvidence,
     ModelFingerprint,
     ResourceBudget,
+    ScreeningObservation,
+    ScreeningResult,
     SessionSpecification,
     ShardFingerprint,
     SystemTopology,
     ToolchainFingerprint,
 )
 
+_SCHEMA_VERSION = 5
 
-def write_observation(
-    path: Path,
-    observation: BenchmarkObservation,
-    session_spec: SessionSpecification | None = None,
-) -> None:
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _make_event(
+    event_type: str,
+    session_id: str,
+    payload: dict[str, object],
+    parent_session_id: str | None = None,
+) -> dict[str, object]:
+    return {
+        "event_type": event_type,
+        "event_version": 1,
+        "session_id": session_id,
+        "parent_session_id": parent_session_id,
+        "timestamp": _now(),
+        **payload,
+    }
+
+
+# ── Journal I/O ─────────────────────────────────────────────────
+
+
+def _read_journal(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        raw = path.read_text()
+    except OSError as e:
+        raise JournalError(f"Cannot read journal at {path}: {e}") from e
+    if not raw.strip():
+        raise JournalError(f"Journal at {path} is empty")
+    try:
+        raw_data: Any = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise JournalError(
+            f"Journal at {path} contains invalid JSON: {e}",
+        ) from e
+    data: dict[str, Any] = raw_data if isinstance(raw_data, dict) else {}
+    if data.get("version") == 4:
+        sid = "v4-legacy"
+        event_type = "observation_completed" if "samples_tps" in data else "outcome_recorded"
+        event: dict[str, object] = {
+            "event_type": event_type,
+            "event_version": 1,
+            "session_id": sid,
+            "parent_session_id": None,
+            "timestamp": "unknown",
+            "data": data,
+        }
+        return {"schema_version": _SCHEMA_VERSION, "events": [event]}
+    if data.get("schema_version") == _SCHEMA_VERSION:
+        return data
+    sv = data.get("schema_version")
+    if sv is not None:
+        sid = f"v{sv}-incompatible"
+        event = {
+            "event_type": "incompatible_schema",
+            "event_version": 1,
+            "session_id": sid,
+            "parent_session_id": None,
+            "timestamp": "unknown",
+            "data": data,
+            "reason": f"Incompatible schema version v{sv} — cannot migrate",
+        }
+        return {"schema_version": _SCHEMA_VERSION, "events": [event]}
+    return {"schema_version": _SCHEMA_VERSION, "events": []}
+
+
+def _atomic_write(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = _observation_to_dict(observation)
-    if session_spec is not None:
-        data["session_spec"] = _session_spec_to_dict(session_spec)
-    _atomic_write_json(path, data)
-
-
-def write_outcome(
-    path: Path,
-    outcome: CandidateOutcome,
-    session_spec: SessionSpecification | None = None,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data = _outcome_to_dict(outcome)
-    if session_spec is not None:
-        data["session_spec"] = _session_spec_to_dict(session_spec)
-    _atomic_write_json(path, data)
-
-
-def _atomic_write_json(path: Path, data: dict[str, object]) -> None:
     fd, tmp_path = tempfile.mkstemp(
         dir=str(path.parent),
         prefix=f".{path.name}.",
@@ -62,6 +117,237 @@ def _atomic_write_json(path: Path, data: dict[str, object]) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def _append_events(path: Path, new_events: list[dict[str, Any]]) -> None:
+    journal = _read_journal(path) or {"schema_version": _SCHEMA_VERSION, "events": []}
+    journal["events"].extend(new_events)
+    _atomic_write(path, journal)
+
+
+# ── Event factories ─────────────────────────────────────────────
+
+
+def _make_session_start_event(
+    spec: SessionSpecification,
+    session_id: str,
+    parent_session_id: str | None,
+    fingerprint_components: dict[str, object],
+    fingerprint_digest: str,
+    reason: str | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "fingerprint_digest": fingerprint_digest,
+        "fingerprint_components": fingerprint_components,
+        "session_spec": _session_spec_to_dict(spec),
+    }
+    if reason:
+        payload["derivation_reason"] = reason
+    return _make_event("session_start", session_id, payload, parent_session_id=parent_session_id)
+
+
+def _make_observation_event(
+    observation: BenchmarkObservation,
+    session_id: str,
+    parent_session_id: str | None = None,
+) -> dict[str, object]:
+    payload = _observation_to_dict(observation)
+    return _make_event("observation_completed", session_id, {
+        "observation": payload,
+    }, parent_session_id=parent_session_id)
+
+
+def _make_outcome_event(
+    outcome: CandidateOutcome,
+    session_id: str,
+    parent_session_id: str | None = None,
+) -> dict[str, object]:
+    payload = _outcome_to_dict(outcome)
+    payload.pop("version", None)
+    return _make_event("outcome_recorded", session_id, {
+        "outcome": payload,
+    }, parent_session_id=parent_session_id)
+
+
+def _make_search_decision_event(
+    candidate: dict[str, object],
+    disposition: str,
+    reason: str,
+    session_id: str,
+    parent_session_id: str | None = None,
+) -> dict[str, object]:
+    return _make_event("search_decision", session_id, {
+        "candidate": candidate,
+        "disposition": disposition,
+        "reason": reason,
+    }, parent_session_id=parent_session_id)
+
+
+def _screening_observation_to_dict(obs: ScreeningObservation) -> dict[str, object]:
+    return {
+        "candidate": asdict(obs.candidate),
+        "pp_samples": list(obs.pp_samples),
+        "tg_samples": list(obs.tg_samples),
+        "memory_bytes": obs.memory_bytes,
+        "memory": _memory_evidence_to_dict(obs.memory) if obs.memory else None,
+        "observed_prompt": obs.observed_prompt,
+        "observed_generation": obs.observed_generation,
+        "observed_depth": obs.observed_depth,
+        "observed_total": obs.observed_total,
+    }
+
+
+def _screening_result_to_dict(result: ScreeningResult) -> dict[str, object]:
+    d: dict[str, object] = {
+        "version": 1,
+        "candidate": asdict(result.candidate),
+        "success": result.success,
+        "disposition": result.disposition,
+        "reason": result.reason,
+        "provenance": result.provenance,
+    }
+    if result.observation is not None:
+        d["observation"] = _screening_observation_to_dict(result.observation)
+    return d
+
+
+def _memory_evidence_to_dict(me: MemoryEvidence) -> dict[str, object]:
+    return {
+        "ram_bytes": me.ram_bytes,
+        "vram_bytes": me.vram_bytes,
+        "quality": me.quality,
+    }
+
+
+def _make_measurement_completed_event(
+    result: ScreeningResult,
+    session_id: str,
+    parent_session_id: str | None = None,
+) -> dict[str, object]:
+    return _make_event("measurement_completed", session_id, {
+        "screening_result": _screening_result_to_dict(result),
+    }, parent_session_id=parent_session_id)
+
+
+# ── Public API ──────────────────────────────────────────────────
+
+
+def write_observation(
+    path: Path,
+    observation: BenchmarkObservation,
+    session_spec: SessionSpecification | None = None,
+    session_id: str | None = None,
+    parent_session_id: str | None = None,
+) -> None:
+    sid = session_id or _uuid4().hex
+    event = _make_observation_event(observation, sid, parent_session_id=parent_session_id)
+    if session_spec is not None:
+        event["session_spec"] = _session_spec_to_dict(session_spec)
+    _append_events(path, [event])
+
+
+def write_outcome(
+    path: Path,
+    outcome: CandidateOutcome,
+    session_spec: SessionSpecification | None = None,
+    session_id: str | None = None,
+    parent_session_id: str | None = None,
+) -> None:
+    sid = session_id or _uuid4().hex
+    event = _make_outcome_event(outcome, sid, parent_session_id=parent_session_id)
+    if session_spec is not None:
+        event["session_spec"] = _session_spec_to_dict(session_spec)
+    _append_events(path, [event])
+
+
+def write_session_start(
+    path: Path,
+    spec: SessionSpecification,
+    session_id: str,
+    parent_session_id: str | None,
+    fingerprint_components: dict[str, object],
+    fingerprint_digest: str,
+    reason: str | None = None,
+) -> None:
+    event = _make_session_start_event(
+        spec, session_id, parent_session_id,
+        fingerprint_components, fingerprint_digest,
+        reason=reason,
+    )
+    _append_events(path, [event])
+
+
+def write_search_decision(
+    path: Path,
+    candidate: dict[str, object],
+    disposition: str,
+    reason: str,
+    session_id: str,
+    parent_session_id: str | None = None,
+) -> None:
+    event = _make_search_decision_event(
+        candidate, disposition, reason, session_id,
+        parent_session_id=parent_session_id,
+    )
+    _append_events(path, [event])
+
+
+def write_measurement_completed(
+    path: Path,
+    result: ScreeningResult,
+    session_id: str,
+    parent_session_id: str | None = None,
+) -> None:
+    event = _make_measurement_completed_event(
+        result, session_id, parent_session_id=parent_session_id,
+    )
+    _append_events(path, [event])
+
+
+def read_journal_events(path: Path) -> list[dict[str, Any]]:
+    journal = _read_journal(path)
+    if journal is None:
+        return []
+    return list(journal.get("events", []))
+
+
+def list_sessions(path: Path) -> list[dict[str, object]]:
+    events = read_journal_events(path)
+    seen: dict[str, dict[str, object]] = {}
+    for ev in events:
+        sid = ev.get("session_id")
+        if not sid or not isinstance(sid, str):
+            continue
+        if sid not in seen:
+            seen[sid] = {
+                "session_id": sid,
+                "parent_session_id": ev.get("parent_session_id"),
+                "status": "historical",
+                "reason": "",
+                "created_at": ev.get("timestamp", "unknown"),
+            }
+        if ev.get("event_type") == "observation_completed":
+            seen[sid]["has_observation"] = True
+        if ev.get("derivation_reason"):
+            seen[sid]["status"] = "derived"
+            seen[sid]["reason"] = str(ev["derivation_reason"])
+        if ev.get("fingerprint_components"):
+            seen[sid]["fingerprint_components"] = ev["fingerprint_components"]
+    for sid, info in seen.items():
+        if sid == "v4-legacy":
+            info["status"] = "historical"
+            if not info["reason"]:
+                info["reason"] = "Legacy v4 journal format — incompatible schema"
+        elif info.get("status") == "derived":
+            pass
+        elif info.get("has_observation"):
+            info["status"] = "resumable"
+        else:
+            info["status"] = "historical"
+    return list(seen.values())
+
+
+# ── Serialisation helpers (unchanged structure, reused) ─────────
 
 
 def _observation_to_dict(obs: BenchmarkObservation) -> dict[str, object]:

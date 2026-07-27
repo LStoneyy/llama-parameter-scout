@@ -355,15 +355,17 @@ class TestApplication:
 
         assert valid_request.journal_path.exists()
         journal = json.loads(valid_request.journal_path.read_text())
-        assert journal["version"] == 4
-        assert journal["candidate"]["threads"] == 4
-        assert journal["total_ctx"] == 2048
-        assert journal["samples_tps"] == [45.5, 44.8, 45.3]
-        assert journal["median_tps"] == obs.median_tps
-        assert journal["n_measurements"] == 3
-        assert journal["binary_path"] == str(valid_request.binary_path)
-        assert journal["binary_source"] == "explicit"
-        assert journal["model_path"] == str(valid_request.model_path)
+        assert journal["schema_version"] == 5
+        assert len(journal["events"]) == 1
+        o = journal["events"][0]["observation"]
+        assert o["candidate"]["threads"] == 4
+        assert o["total_ctx"] == 2048
+        assert o["samples_tps"] == [45.5, 44.8, 45.3]
+        assert o["median_tps"] == obs.median_tps
+        assert o["n_measurements"] == 3
+        assert o["binary_path"] == str(valid_request.binary_path)
+        assert o["binary_source"] == "explicit"
+        assert o["model_path"] == str(valid_request.model_path)
 
     def test_on_ready_called_before_warmup(
         self,

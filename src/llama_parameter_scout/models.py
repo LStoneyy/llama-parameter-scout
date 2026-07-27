@@ -483,3 +483,19 @@ class NoWinnerReport:
     attempts_used: int
     budget: int
     pareto_frontier: tuple[ParetoEntry, ...] = ()
+
+
+# ── Journal v5 / Session domain ──────────────────────────────────
+
+
+SessionResumeAction = Literal["new", "resumed", "derived"]
+
+
+@dataclass(frozen=True)
+class SessionResumeResult:
+    action: SessionResumeAction
+    session_id: str
+    parent_session_id: str | None = None
+    observation: BenchmarkObservation | None = None
+    mismatch_reason: str | None = None
+    completed_search_results: tuple[ScreeningResult, ...] = ()

@@ -27,16 +27,28 @@ class ProcessResult:
 
 class ProcessRunner(Protocol):
     def run(self, argv: Sequence[str]) -> ProcessResult:
-        ...
+        """Run the command and return a ProcessResult.
+
+        The implementation must not raise FileNotFoundError or similar
+        OS-level exceptions for missing executables; those should be
+        returned as a non-zero returncode ProcessResult.
+        """
 
 
 class ProductionRunner:
     def run(self, argv: Sequence[str]) -> ProcessResult:
-        result = subprocess.run(
-            [str(a) for a in argv],
-            capture_output=True,
-            text=True,
-        )
+        try:
+            result = subprocess.run(
+                [str(a) for a in argv],
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError as e:
+            return ProcessResult(
+                returncode=127,
+                stdout="",
+                stderr=str(e),
+            )
         return ProcessResult(
             returncode=result.returncode,
             stdout=result.stdout,

@@ -42,6 +42,21 @@ from llama_parameter_scout.runner import (
     ProcessStartError,
 )
 
+
+def _read_journal_first_payload(path: Path) -> dict[str, Any]:
+    raw: Any = json.loads(path.read_text())
+    if raw.get("schema_version") == 5:
+        ev: Any = raw["events"][0]
+        et = str(ev.get("event_type", ""))
+        if et == "observation_completed":
+            obs: Any = ev["observation"]
+            return dict(obs)
+        outcome: Any = ev.get("outcome")
+        if outcome is not None:
+            return dict(outcome)
+        return dict(ev)
+    return dict(raw)
+
 _TOOLCHAIN_FLAGS = "-m,-p,-n,-d,-t,-b,-ub,-ngl,-fa,-ctk,-ctv,-o,-r"
 _TOOLCHAIN_STDOUT = (
     "version: 1\n"
@@ -575,7 +590,7 @@ class TestToolchainProbeFailure:
         assert outcome.disposition == "unsupported"
         assert outcome.process_launched is False
         assert sample_request.journal_path.exists()
-        data = json.loads(sample_request.journal_path.read_text())
+        data = _read_journal_first_payload(sample_request.journal_path)
         assert data["disposition"] == "unsupported"
         assert data["process_launched"] is False
 
@@ -774,8 +789,7 @@ class TestCandidateLifecycle:
         assert outcome.disposition == "completed"
         journal_path = sample_request.journal_path
         assert journal_path.exists()
-        data = json.loads(journal_path.read_text())
-        assert data["version"] == 4
+        data = _read_journal_first_payload(journal_path)
         assert data["disposition"] == "completed"
         assert data["candidate"]["threads"] == 4
         assert data["samples_tps"] == [10.0, 11.0, 12.0]
@@ -799,8 +813,7 @@ class TestCandidateLifecycle:
         assert outcome.disposition == "crash"
         journal_path = sample_request.journal_path
         assert journal_path.exists()
-        data = json.loads(journal_path.read_text())
-        assert data["version"] == 4
+        data = _read_journal_first_payload(journal_path)
         assert data["disposition"] == "crash"
         assert "failure" in data["diagnostic"]
         assert data["safe_next_action"] != ""
@@ -1571,7 +1584,7 @@ class TestPreExecutionJournaling:
         outcome = app.evaluate_candidate(req)
         assert outcome.disposition == "unsupported"
         assert req.journal_path.exists()
-        data = json.loads(req.journal_path.read_text())
+        data = _read_journal_first_payload(req.journal_path)
         assert data["disposition"] == "unsupported"
         assert data["process_launched"] is False
 
@@ -1618,7 +1631,7 @@ class TestPreExecutionJournaling:
         outcome = app.evaluate_candidate(req, session_spec=spec)
         assert outcome.disposition == "pruned"
         assert req.journal_path.exists()
-        data = json.loads(req.journal_path.read_text())
+        data = _read_journal_first_payload(req.journal_path)
         assert data["disposition"] == "pruned"
         assert data["safe_next_action"] != ""
 
@@ -1640,7 +1653,7 @@ class TestPreExecutionJournaling:
 
         assert outcome.disposition == "crash"
         assert sample_request.journal_path.exists()
-        data = json.loads(sample_request.journal_path.read_text())
+        data = _read_journal_first_payload(sample_request.journal_path)
         assert data["disposition"] == "crash"
         assert data["process_launched"] is True
         assert "failure" in data["diagnostic"]
@@ -1694,7 +1707,7 @@ class TestWarmupFailureJournal:
 
         assert outcome.disposition == "timeout"
         assert sample_request.journal_path.exists()
-        data = json.loads(sample_request.journal_path.read_text())
+        data = _read_journal_first_payload(sample_request.journal_path)
         assert data["disposition"] == "timeout"
         assert data["diagnostic"] != ""
 

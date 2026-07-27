@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
-from llama_parameter_scout.journal import write_observation
+from llama_parameter_scout.journal import read_journal_events, write_observation
 from llama_parameter_scout.models import (
     BenchmarkObservation,
     CandidateConfig,
     ModelFingerprint,
+    ShardFingerprint,
     ToolchainFingerprint,
 )
 
@@ -52,6 +54,16 @@ def _make_observation() -> BenchmarkObservation:
     )
 
 
+def _obs_data(path: Path) -> dict[str, Any]:
+    events = read_journal_events(path)
+    assert len(events) >= 1
+    ev = events[0]
+    assert ev["event_type"] == "observation_completed"
+    obs = ev["observation"]
+    assert isinstance(obs, dict)
+    return obs
+
+
 class TestWriteObservation:
     def test_writes_file(self, tmp_path: Path) -> None:
         path = tmp_path / "journal.json"
@@ -64,26 +76,33 @@ class TestWriteObservation:
         obs = _make_observation()
         write_observation(path, obs)
         data = json.loads(path.read_text())
-        assert data["version"] == 4
-        assert data["candidate"]["threads"] == 4
-        assert data["total_ctx"] == 2048
-        assert data["prompt_ctx"] == 512
-        assert data["generation_ctx"] == 1024
-        assert data["depth_ctx"] == 512
-        assert data["samples_tps"] == [45.5, 44.8, 45.3]
-        assert data["median_tps"] == 45.3
-        assert isinstance(data["dispersion_tps"], float)
-        assert data["n_measurements"] == 3
-        assert data["binary_path"] == "/usr/local/bin/llama-bench"
-        assert data["binary_source"] == "explicit"
-        assert data["model_path"] == "/tmp/model.gguf"
+        assert data["schema_version"] == 5
+        assert len(data["events"]) == 1
+        ev = data["events"][0]
+        assert ev["event_type"] == "observation_completed"
+        assert ev["event_version"] == 1
+        assert ev["session_id"] != ""
+        o = ev["observation"]
+        assert o["version"] == 4
+        assert o["candidate"]["threads"] == 4
+        assert o["total_ctx"] == 2048
+        assert o["prompt_ctx"] == 512
+        assert o["generation_ctx"] == 1024
+        assert o["depth_ctx"] == 512
+        assert o["samples_tps"] == [45.5, 44.8, 45.3]
+        assert o["median_tps"] == 45.3
+        assert isinstance(o["dispersion_tps"], float)
+        assert o["n_measurements"] == 3
+        assert o["binary_path"] == "/usr/local/bin/llama-bench"
+        assert o["binary_source"] == "explicit"
+        assert o["model_path"] == "/tmp/model.gguf"
 
     def test_toolchain_in_journal(self, tmp_path: Path) -> None:
         path = tmp_path / "journal.json"
         obs = _make_observation()
         write_observation(path, obs)
-        data = json.loads(path.read_text())
-        tc = data["toolchain"]
+        o = _obs_data(path)
+        tc = o["toolchain"]
         assert tc["binary_path"] == "/usr/local/bin/llama-bench"
         assert tc["version"] == "1234"
         assert tc["supported_flags"] == [
@@ -97,8 +116,8 @@ class TestWriteObservation:
         path = tmp_path / "journal.json"
         obs = _make_observation()
         write_observation(path, obs)
-        data = json.loads(path.read_text())
-        m = data["model"]
+        o = _obs_data(path)
+        m = o["model"]
         assert m["architecture"] == "llama"
         assert m["parameter_count"] == 7_000_000_000
         assert m["context_length"] == 4096
@@ -109,7 +128,6 @@ class TestWriteObservation:
         assert m["diagnostics"] == []
 
     def test_shards_in_journal(self, tmp_path: Path) -> None:
-        from llama_parameter_scout.models import ShardFingerprint
         path = tmp_path / "journal.json"
         obs = _make_observation()
         obs = BenchmarkObservation(
@@ -151,8 +169,8 @@ class TestWriteObservation:
             ),
         )
         write_observation(path, obs)
-        data = json.loads(path.read_text())
-        shards = data["model"]["shards"]
+        o = _obs_data(path)
+        shards = o["model"]["shards"]
         assert len(shards) == 2
         assert shards[0]["path"] == "/tmp/model-00001-of-00002.gguf"
         assert shards[0]["size_bytes"] == 12345
