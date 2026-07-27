@@ -572,3 +572,60 @@ class MtpEvidence:
     off_argv: tuple[str, ...]
     on_argv: tuple[str, ...]
     comparison: MtpComparison
+
+
+# ── MTP Profile domain models ─────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class MtpSearchProfile:
+    max_attempts: int = 6
+    draft_gpu_layers_values: tuple[int, ...] = (0, -1)
+    draft_n_max_values: tuple[int, ...] = (16, 32)
+    draft_n_cpu_moe_values: tuple[int, ...] = (0, 1)
+
+    def __post_init__(self) -> None:
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
+        if not self.draft_gpu_layers_values:
+            raise ValueError("draft_gpu_layers_values must not be empty")
+        if not self.draft_n_max_values:
+            raise ValueError("draft_n_max_values must not be empty")
+
+
+@dataclass(frozen=True)
+class MtpDraftSettings:
+    n_gpu_layers_draft: int
+    n_cpu_moe_draft: int | None = None
+    draft_max: int = 16
+
+
+MtpProfileDisposition = Literal[
+    "not_attempted",
+    "no_fit",
+    "incomplete_evidence",
+    "not_established",
+    "established",
+]
+
+
+@dataclass(frozen=True)
+class MtpProfileObservation:
+    main_candidate: CandidateConfig
+    draft_settings: MtpDraftSettings
+    comparison: MtpComparison | None
+    combined_memory: MemoryEvidence | None
+    disposition: MtpProfileDisposition
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class MtpProfileReport:
+    normal_winner: ValidatedCandidate
+    mtp_main_candidate: CandidateConfig | None
+    draft_fingerprint: ModelFingerprint
+    observations: tuple[MtpProfileObservation, ...]
+    recommendation: MtpComparison | None
+    benefit: MtpBenefit
+    note: str = ""
+    winning_draft_settings: MtpDraftSettings | None = None

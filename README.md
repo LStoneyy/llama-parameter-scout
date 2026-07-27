@@ -2,9 +2,12 @@
 
 Benchmark llama.cpp models across candidate configurations by driving `llama-bench` with explicit settings, collecting throughput samples, and journaling results.
 
-> **Status:** issue 11 — MTP (Multi-Token Prediction) comparison
-> with local draft model, ephemeral loopback-only llama-server,
-> paired MTP-off/MTP-on evidence, dispersion-based tie detection,
+> **Status:** issue 12 — Bounded MTP (Multi-Token Prediction) Profile
+> with local draft model, draft GPU layers / n-max / conditional MoE
+> draft CPU settings grid, draft-memory preflight reservation,
+> separate MTP main candidate selection from normal winner,
+> paired MTP-off/MTP-on evidence, complete-metrics/no-fit policy,
+> dispersion-based tie detection (off preferred on ties),
 > and explicit synthetic-throughput caveats.
 
 ## Setup
@@ -602,6 +605,115 @@ lifecycle = FakeServerLifecycle()
 result = app.compare_mtp(..., server_lifecycle=lifecycle)
 ```
 
+## MTP Profile (issue 12)
+
+A bounded search over draft-model settings to find the best MTP configuration
+that fits within the resource budget. The profile preserves the normal non-MTP
+winner from the main search and produces a separate MTP recommendation.
+
+### Bounded profile limits
+
+The `MtpSearchProfile` defines the finite draft grid:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `max_attempts` | 6 | Maximum draft settings evaluated |
+| `draft_gpu_layers_values` | `(0, -1)` | Draft GPU layers to try |
+| `draft_n_max_values` | `(16, 32)` | Max draft tokens per speculative iteration |
+| `draft_n_cpu_moe_values` | `(0, 1)` | Draft n_cpu_moe (MoE draft only) |
+
+When the draft model's fingerprint reports `is_moe=True`, each grid entry
+also includes `n_cpu_moe_draft` values; non-MoE drafts skip this dimension.
+The grid is truncated to `max_attempts` if the cross product exceeds it.
+
+### Draft-memory reservation
+
+The draft model's shard byte sum is used as a conservative preflight
+reservation — not a measured peak usage. The reservation is placed in:
+
+- **RAM** when memory is unified or draft GPU layers are 0.
+- **VRAM** when memory is discrete and draft GPU layers are nonzero.
+
+Both the main candidate memory evidence and the draft reservation must fit
+within the resource budget after headroom. Only candidates with
+`MemoryEvidence(quality="complete")` on all constrained resources are
+eligible — partial, estimated, incomparable, or missing evidence cannot
+prove fit.
+
+### Complete-metrics / no-fit policy
+
+Each paired MTP-off/MTP-on evaluation produces a `MemoryEvidence` for the
+combined run. A result contributes to the recommendation only when:
+
+1. **MtpComparison.benefit is `"established"`** — improvement exceeds the
+   dispersion-derived tie bound.
+2. **Combined memory quality is `"complete"`** and fits the budget
+   (same headroom and reservation rules as candidate selection).
+
+Results with partial or incomplete combined memory evidence are recorded
+as `incomplete_evidence` observations and excluded from ranking. If no
+fitted candidate exists the report returns `benefit="not_established"` and
+`recommendation=None`.
+
+### Separate normal vs MTP evidence
+
+The `MtpProfileReport` carries:
+
+- `normal_winner` — the exact `ValidatedCandidate` from the main search,
+  unchanged.
+- `mtp_main_candidate` — a separate `CandidateConfig` selected from the
+  winner or alternatives (in ranking order) that can accommodate the draft
+  reservation.
+- `observations` — every paired evaluation with its comparison, combined
+  memory, and disposition.
+- `recommendation` — the best `MtpComparison` with established benefit and
+  complete fitted memory, or `None`.
+- `benefit` — `"established"` or `"not_established"`.
+
+Evidence from MTP profiling is never merged into the main llama-bench
+ranking or the normal `ValidatedRecommendation`.
+
+### Usage via Application
+
+```python
+from llama_parameter_scout.application import Application
+from llama_parameter_scout.models import MtpSearchProfile
+
+app = Application(runner)
+
+profile = app.collect_mtp_profile(
+    validation_result=validated_recommendation,
+    draft_model_path=Path("/path/to/draft.gguf"),
+    server_path=Path("/path/to/llama-server"),
+    session_spec=session_spec,
+    profile=MtpSearchProfile(),  # optional, uses defaults
+)
+
+print(profile.benefit)                # "established" or "not_established"
+print(profile.normal_winner)          # unchanged original winner
+print(profile.mtp_main_candidate)     # MTP-specific main candidate
+print(profile.recommendation)         # best MtpComparison or None
+```
+
+### Injection seam
+
+An evaluator protocol backed by `collect_mtp_evidence` is used for
+deterministic tests. Pass `_warmup_fn` and `_measure_fn` to the
+Application method as before.
+
+### Export
+
+The JSON report includes a separate `mtp_profile` section with the normal
+winner, MTP main candidate, draft fingerprint and provenance, all
+observations and dispositions, and the recommendation or benefit-not-
+established reason. Markdown rendering follows the same evidence separation
+and applies the existing home-directory path redaction.
+
+The `build_llama_server_command` and `build_preset_ini_section` functions
+accept optional `draft_model_path` and `draft_settings` parameters. Valid
+preset keys: `model_draft`, `n_gpu_layers_draft`, `n_cpu_moe_draft`,
+`draft_max`.
+
 ## Tests
 
 ```bash
@@ -617,6 +729,7 @@ uv run pytest tests/test_cli.py -v
 uv run pytest tests/test_issue09.py -v
 uv run pytest tests/test_issue10.py -v
 uv run pytest tests/test_issue11.py -v
+uv run pytest tests/test_issue12.py -v
 
 # Type check
 uv run mypy src tests
