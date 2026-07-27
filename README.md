@@ -2,20 +2,44 @@
 
 Benchmark llama.cpp models across candidate configurations by driving `llama-bench` with explicit settings, collecting throughput samples, and journaling results.
 
-> **Status:** issue 13 — Textual TUI (keyboard-driven wizard,
-> review/confirm, live progress, cancellation/resume, results
-> tabs with copy/save). issue 12 — Bounded MTP Profile with
-> local draft model, draft GPU layers / n-max / conditional MoE
-> draft CPU settings grid, draft-memory preflight reservation,
-> separate MTP main candidate selection from normal winner,
-> paired MTP-off/MTP-on evidence, complete-metrics/no-fit policy,
-> dispersion-based tie detection (off preferred on ties),
-> and explicit synthetic-throughput caveats.
+## Installation
 
-## Setup
+### via pipx (PyPI)
 
 ```bash
+pipx install llama-parameter-scout
+llama-parameter-scout --help
+```
+
+### via uv tool (PyPI)
+
+```bash
+uv tool install llama-parameter-scout
+llama-parameter-scout --help
+```
+
+### from source (development)
+
+```bash
+git clone <repo>
+cd llama-parameter-scout
 uv sync --all-extras
+```
+
+## Quick start
+
+```bash
+# Single-run benchmark via CLI
+llama-parameter-scout \
+  --llama-bench /path/to/llama-bench \
+  --model-path /path/to/model.gguf \
+  --journal-path ./journal.json \
+  --n-ctx 2048 --n-prompt 512 --n-generation 1024 --n-depth 512 \
+  --threads 4 --batch-size 512 --ubatch-size 512 --n-gpu-layers 0 \
+  --cpu-only --yes
+
+# Launch the Textual TUI wizard
+llama-parameter-scout --tui
 ```
 
 ## TUI (Textual User Interface)
@@ -766,7 +790,7 @@ preset keys: `model_draft`, `n_gpu_layers_draft`, `n_cpu_moe_draft`,
 ## Tests
 
 ```bash
-# All unit/acceptance tests (excludes real-binary smoke via auto-deselect)
+# All unit/acceptance tests (excludes real-binary and real-hardware via auto-deselect)
 uv run pytest -v
 
 # Targeted files
@@ -780,6 +804,12 @@ uv run pytest tests/test_issue10.py -v
 uv run pytest tests/test_issue11.py -v
 uv run pytest tests/test_issue12.py -v
 uv run pytest tests/test_tui.py -v
+
+# Issue 14: release smoke tests (wheel build + install into isolated venv)
+uv run pytest tests/test_issue14.py -v -m smoke
+
+# Issue 14: network safety tests (verifies no outbound connections during runtime)
+uv run pytest tests/test_issue14.py -v -m network
 
 # Type check
 uv run mypy src tests
@@ -799,6 +829,63 @@ MODEL_PATH=/path/to/model.gguf \
 ```
 
 The test is skipped unless both environment variables are set. It is excluded from the default `uv run pytest` run.
+
+### Opt-in real-hardware smoke suite
+
+Tests marked `real_hardware` require a real llama-bench binary and GGUF model on local hardware. GPU is optional — CPU-only smoke runs are validated in CI; GPU validation remains unavailable in hosted CI. To run:
+
+```bash
+uv run pytest -v -m real_hardware
+```
+
+These tests are not validated in CI because no GPU-equipped CI runners are configured. They are intended for local validation on your specific hardware.
+
+## GPU and backend support matrix
+
+| Backend | CI validation | Notes |
+|---------|--------------|-------|
+| CPU | CI-validated on Windows/macOS/Linux | Default; all smoke and unit tests exercise CPU-only code paths |
+| CUDA | Not CI-validated (no GPU runners) | Used via `--device` and `llama-bench` with CUDA backend; validation requires local GPU machine and `real_hardware` marker |
+| HIP | Not CI-validated (no AMD GPU runners) | Same as CUDA; validated locally with compatible AMD GPUs |
+| Metal | Not CI-validated (macOS GPU not available in CI) | macOS CI runners do not have GPU access; validate locally |
+| Vulkan | Not CI-validated (no Vulkan runners) | Validate locally |
+
+All CI-validated entries are tested automatically on each push/PR via the `quality` and `smoke` jobs. Hardware-validated entries require explicit local `real_hardware` test runs. No hosted GPU CI runners are available, so no GPU backend claims are validated in CI.
+
+## Network safety
+
+llama-parameter-scout does not make outbound network connections at rest or during benchmark operations. The only network binding is the optional MTP loopback server, which binds to `127.0.0.1` only. No data is sent to external services.
+
+**Runtime contract:** the package itself has no outbound network dependencies during import, CLI parsing, or benchmark execution.
+
+**Installation-time:** `pip install` or `uv tool install` may access package indexes to resolve dependencies (e.g. `textual`). This is installation-time and outside the runtime no-outbound contract.
+
+These properties are verified by the `@pytest.mark.network` tests in `tests/test_issue14.py`, which monkey-patch `socket.connect`/`socket.connect_ex`/`socket.bind` to reject non-loopback addresses. The monkey-patch uses the `block_network` fixture with automatic teardown, so socket changes never leak between tests.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Action |
+|---------|-------------|--------|
+| `Binary not found` | llama-bench not installed or not in PATH | Install llama.cpp and ensure the binary is discoverable |
+| `Model not found` | GGUF model path is invalid | Verify the model file exists and is readable |
+| `Unsupported format` | File is not a `.gguf` file | Only GGUF models are supported |
+| `ToolchainError` | llama-bench --version/--help failed | Check your llama-bench build is functional |
+| `MalformedOutputError` | llama-bench output is not parseable | Update to a compatible llama-bench version |
+| `No accelerators detected` | Device selection without GPU | Use `--cpu-only` if no GPU is available |
+| `Session spec fingerprint mismatch` | Model changed between sessions | A new derived session will be created |
+| `JournalError` | Journal file is corrupt or unwritable | Check permissions and file integrity |
+| Package not importable | Dependencies missing | Run `uv sync --all-extras` or install via pipx/uv tool |
+
+## Result interpretation
+
+- **Median throughput** (t/s): the middle value of sorted per-repetition throughput samples. More robust than mean against outliers.
+- **Dispersion** (t/s): population standard deviation of throughput samples. Lower is more consistent.
+- **Relative dispersion**: dispersion divided by median. Used by search profiles as a stability threshold.
+- **PP score**: prompt processing throughput normalized to baseline.
+- **TG score**: text generation throughput normalized to baseline.
+- **Balanced score**: geometric mean of PP and TG scores.
+
+A candidate is considered stable when its relative dispersion is below the profile's `dispersion_threshold`. The Quick profile threshold is 0.15 (15%), Standard is 0.12, Thorough is 0.10.
 
 ## Journal schema (v5)
 
@@ -1018,6 +1105,7 @@ tracker = StopTracker(max_stops=3)
 Every candidate evaluation prints the disposition, diagnostic, and next action:
 
 ```
+
 Disposition: completed
 
 Warmup complete.
@@ -1030,6 +1118,7 @@ Journal: /path/to/journal.json
 For failures:
 
 ```
+
 Disposition: crash
 Diagnostic: Process exited with code 1.
 Segmentation fault
@@ -1037,3 +1126,39 @@ Next action: Check binary compatibility, model integrity, and system resources.
 ```
 
 Exit code is 1 for any disposition other than `completed`.
+
+## Developer commands
+
+All commands use `uv run`:
+
+```bash
+# Run the CLI (single benchmark)
+uv run llama-parameter-scout --help
+
+# Run the TUI
+uv run llama-parameter-scout --tui
+
+# Run all default tests (excludes real_binary and real_hardware)
+uv run pytest -v
+
+# Run smoke tests (wheel build + install into isolated venv)
+uv run pytest tests/test_issue14.py -v -m smoke --tb=short -x
+
+# Run network safety tests (verifies no outbound connections during runtime)
+uv run pytest tests/test_issue14.py -v -m network
+
+# Run issue-specific tests
+uv run pytest tests/test_issue14.py -v
+
+# Type check (strict mypy)
+uv run mypy src tests
+
+# Lint
+uv run ruff check src tests
+
+# Build package (wheel + sdist)
+uv build
+
+# List sessions from an existing journal
+uv run llama-parameter-scout --list-sessions --journal-path ./journal.json
+```

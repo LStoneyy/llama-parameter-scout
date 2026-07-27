@@ -1,11 +1,38 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
 [project]
 name = "llama-parameter-scout"
 version = "0.1.0"
 description = "Benchmark llama.cpp models across candidate configurations"
+readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.11"
+authors = [
+    {name = "llama-parameter-scout contributors"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Benchmark",
+]
 dependencies = [
     "textual>=2.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/lukas/llama-parameter-scout"
+Source = "https://github.com/lukas/llama-parameter-scout"
 
 [project.scripts]
 llama-parameter-scout = "llama_parameter_scout.cli:main"
@@ -16,6 +43,7 @@ dev = [
     "pytest-asyncio>=0.24",
     "mypy>=1",
     "ruff>=0.4",
+    "build>=1.2",
 ]
 
 [tool.uv]
@@ -25,8 +53,11 @@ package = true
 testpaths = ["tests"]
 markers = [
     "real_binary: tests that invoke a real llama-bench binary",
+    "real_hardware: opt-in tests that require a real llama-bench binary and model on local hardware (GPU optional; CI runs CPU smoke only)",
+    "smoke: fast smoke tests run on every CI run",
+    "network: tests that verify network isolation",
 ]
-addopts = "-m 'not real_binary'"
+addopts = "-m 'not real_binary and not real_hardware and not smoke'"
 asyncio_mode = "auto"
 
 [tool.mypy]

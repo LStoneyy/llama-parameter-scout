@@ -10,7 +10,7 @@ from llama_parameter_scout.application import Application
 from llama_parameter_scout.models import CandidateConfig, NctxComposition, SingleRunRequest
 from llama_parameter_scout.runner import ProductionRunner
 
-pytestmark = pytest.mark.real_binary
+pytestmark = [pytest.mark.real_binary, pytest.mark.real_hardware]
 
 LLAMA_BENCH_PATH = os.environ.get("LLAMA_BENCH_PATH") or ""
 MODEL_PATH = os.environ.get("MODEL_PATH") or ""
@@ -48,5 +48,7 @@ def test_real_binary_smoke(tmp_path: Path) -> None:
 
     assert request.journal_path.exists()
     data = json.loads(request.journal_path.read_text())
-    assert data["version"] == 2
-    assert data["n_measurements"] >= 3
+    assert data["schema_version"] == 5
+    events = data.get("events", [])
+    assert len(events) >= 1
+    assert events[-1]["event_type"] == "observation_completed"

@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+jobs:
+  quality:
+    name: "Quality (${{ matrix.os }})"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - name: Sync dependencies
+        run: uv sync --frozen --all-extras
+      - name: Lint (ruff)
+        run: uv run ruff check src tests
+      - name: Type check (mypy)
+        run: uv run mypy src tests
+      - name: Test (default, excludes real_binary/real_hardware)
+        run: uv run pytest -v --tb=short
+
+  smoke:
+    name: "CPU Smoke (${{ matrix.os }})"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Sync dependencies
+        run: uv sync --frozen --all-extras
+      - name: Run smoke tests (wheel build, install, import, entry-point)
+        run: uv run pytest tests/test_issue14.py -v -m smoke --tb=short -x
+
+  release-gate:
+    name: Release Gate
+    needs: [quality, smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Check smoke passed
+        run: echo "All release gates passed — smoke tests and quality checks are green."
