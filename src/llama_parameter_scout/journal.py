@@ -17,6 +17,8 @@ from .models import (
     JournalError,
     MemoryEvidence,
     ModelFingerprint,
+    MtpComparison,
+    MtpEvidence,
     ResourceBudget,
     ScreeningObservation,
     ScreeningResult,
@@ -229,6 +231,54 @@ def _make_measurement_completed_event(
     }, parent_session_id=parent_session_id)
 
 
+def _make_mtp_evidence_event(
+    evidence: MtpEvidence,
+    session_id: str,
+    parent_session_id: str | None = None,
+) -> dict[str, object]:
+    return _make_event("mtp_evidence", session_id, {
+        "mtp_evidence": _mtp_evidence_to_dict(evidence),
+    }, parent_session_id=parent_session_id)
+
+
+def _mtp_comparison_to_dict(c: MtpComparison) -> dict[str, object]:
+    return {
+        "benefit": c.benefit,
+        "improvement_pct": c.improvement_pct,
+        "tie_bound_tps": c.tie_bound_tps,
+        "caveat": c.caveat,
+        "off": {
+            "mode": c.off.mode,
+            "samples_tps": list(c.off.samples_tps),
+            "median_tps": c.off.median_tps,
+            "dispersion_tps": c.off.dispersion_tps,
+        },
+        "on": {
+            "mode": c.on.mode,
+            "samples_tps": list(c.on.samples_tps),
+            "median_tps": c.on.median_tps,
+            "dispersion_tps": c.on.dispersion_tps,
+        },
+    }
+
+
+def _mtp_evidence_to_dict(ev: MtpEvidence) -> dict[str, object]:
+    return {
+        "main_fingerprint": _model_to_dict(ev.main_fingerprint),
+        "draft_fingerprint": _model_to_dict(ev.draft_fingerprint),
+        "server_path": ev.server_path,
+        "server_version": ev.server_version,
+        "server_supported_flags": list(ev.server_supported_flags),
+        "candidate": asdict(ev.candidate),
+        "n_ctx": asdict(ev.n_ctx),
+        "cpu_only": ev.cpu_only,
+        "device_id": ev.device_id,
+        "off_argv": list(ev.off_argv),
+        "on_argv": list(ev.on_argv),
+        "comparison": _mtp_comparison_to_dict(ev.comparison),
+    }
+
+
 # ── Public API ──────────────────────────────────────────────────
 
 
@@ -301,6 +351,17 @@ def write_measurement_completed(
     event = _make_measurement_completed_event(
         result, session_id, parent_session_id=parent_session_id,
     )
+    _append_events(path, [event])
+
+
+def write_mtp_evidence(
+    path: Path,
+    evidence: MtpEvidence,
+    session_id: str | None = None,
+    parent_session_id: str | None = None,
+) -> None:
+    sid = session_id or _uuid4().hex
+    event = _make_mtp_evidence_event(evidence, sid, parent_session_id=parent_session_id)
     _append_events(path, [event])
 
 
