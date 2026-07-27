@@ -48,6 +48,9 @@ from .models import (
     ModelFingerprintMismatchError,
     ModelNotFoundError,
     MtpComparison,
+    MtpDraftSettings,
+    MtpProfileReport,
+    MtpSearchProfile,
     MultipleAcceleratorsSelectedError,
     NctxComposition,
     NoAcceleratorSelectedError,
@@ -72,7 +75,12 @@ from .models import (
     UnknownDeviceError,
     ValidatedRecommendation,
 )
-from .mtp import ServerLifecycle
+from .mtp import (
+    ServerLifecycle,
+)
+from .mtp import (
+    compute_combined_preflight as _compute_combined_preflight,
+)
 from .runner import (
     ProcessAdapter,
     ProcessResult,
@@ -2091,6 +2099,96 @@ class Application:
 
         return evidence.comparison
 
+    # ── MTP Profile seam ───────────────────────────────────────────
+
+    def collect_mtp_profile(
+        self,
+        *,
+        validation_result: ValidatedRecommendation,
+        draft_model_path: Path,
+        server_path: Path,
+        session_spec: SessionSpecification,
+        profile: MtpSearchProfile | None = None,
+        server_lifecycle: ServerLifecycle | None = None,
+        main_fingerprint: ModelFingerprint | None = None,
+        draft_fingerprint: ModelFingerprint | None = None,
+        profile_evaluator: Callable[
+            [CandidateConfig, MtpDraftSettings],
+            tuple[MtpComparison, MemoryEvidence],
+        ] | None = None,
+        _warmup_fn: Callable[[int], None] | None = None,
+        _measure_fn: Callable[[int], float] | None = None,
+    ) -> MtpProfileReport:
+        from .mtp import (
+            collect_mtp_evidence as _collect_mtp_evidence,
+        )
+        from .mtp import (
+            collect_mtp_profile as _collect_mtp_profile,
+        )
+
+        if profile is None:
+            profile = MtpSearchProfile()
+
+        cpu_only = session_spec.cpu_only
+        device_id = (
+            session_spec.selected_device_ids[0]
+            if session_spec.selected_device_ids
+            else None
+        )
+
+        main_fp = main_fingerprint or inspect_model(session_spec.model.path)
+        draft_fp = draft_fingerprint or inspect_model(draft_model_path)
+
+        main_model_path = main_fp.path
+        memory_unified = session_spec.topology.memory_unified
+
+        def _resolve_evidence(
+            main_candidate: CandidateConfig,
+        ) -> MemoryEvidence | None:
+            if validation_result.recommendation.candidate == main_candidate:
+                return validation_result.recommendation.memory_evidence
+            for alt in validation_result.alternatives:
+                if alt.candidate == main_candidate:
+                    return alt.memory_evidence
+            return None
+
+        def _evaluator(
+            main_candidate: CandidateConfig,
+            draft_settings: MtpDraftSettings,
+        ) -> tuple[MtpComparison, MemoryEvidence]:
+            candidate_evidence = _resolve_evidence(main_candidate)
+            evidence = _collect_mtp_evidence(
+                candidate=main_candidate,
+                main_model_path=main_model_path,
+                draft_model_path=draft_model_path,
+                server_path=server_path,
+                n_ctx=session_spec.n_ctx,
+                cpu_only=cpu_only,
+                device_id=device_id,
+                runner=self._runner,
+                server_lifecycle=server_lifecycle,
+                main_fingerprint=main_fp,
+                draft_fingerprint=draft_fp,
+                draft_settings=draft_settings,
+                _warmup_fn=_warmup_fn,
+                _measure_fn=_measure_fn,
+            )
+            combined = _compute_combined_preflight(
+                candidate_evidence, draft_fp, draft_settings, memory_unified,
+            ) if candidate_evidence is not None else MemoryEvidence(quality="incomparable")
+            return evidence.comparison, combined
+
+        evaluator = profile_evaluator or _evaluator
+
+        return _collect_mtp_profile(
+            validation_result=validation_result,
+            draft_fingerprint=draft_fp,
+            budget=session_spec.budget,
+            memory_unified=memory_unified,
+            profile=profile,
+            evaluator=evaluator,
+        )
+
     # ── Export seam ───────────────────────────────────────────────
 
     def export_report_json(
@@ -2101,6 +2199,7 @@ class Application:
         model: ModelFingerprint,
         screening_report: ScreeningReport | None = None,
         validation_result: ValidatedRecommendation | NoWinnerReport | None = None,
+        mtp_profile: MtpProfileReport | None = None,
         provenance: LaunchProvenance | None = None,
         include_hashes: bool = False,
     ) -> str:
@@ -2112,6 +2211,7 @@ class Application:
             model=model,
             screening_report=screening_report,
             validation_result=validation_result,
+            mtp_profile=mtp_profile,
             provenance=provenance,
             include_hashes=include_hashes,
         )
@@ -2124,6 +2224,7 @@ class Application:
         model: ModelFingerprint,
         screening_report: ScreeningReport | None = None,
         validation_result: ValidatedRecommendation | NoWinnerReport | None = None,
+        mtp_profile: MtpProfileReport | None = None,
         provenance: LaunchProvenance | None = None,
         include_hashes: bool = False,
     ) -> str:
@@ -2135,6 +2236,7 @@ class Application:
             model=model,
             screening_report=screening_report,
             validation_result=validation_result,
+            mtp_profile=mtp_profile,
             provenance=provenance,
             include_hashes=include_hashes,
         )

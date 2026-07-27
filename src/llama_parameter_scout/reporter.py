@@ -13,6 +13,10 @@ from .models import (
     LaunchProvenance,
     MemoryEvidence,
     ModelFingerprint,
+    MtpComparison,
+    MtpDraftSettings,
+    MtpMeasurement,
+    MtpProfileReport,
     NctxComposition,
     NoWinnerReport,
     ProvisionalLeader,
@@ -199,6 +203,8 @@ def build_llama_server_command(
     *,
     cpu_only: bool = True,
     selected_device_ids: tuple[int, ...] = (),
+    draft_model_path: str | None = None,
+    draft_settings: MtpDraftSettings | None = None,
 ) -> list[str]:
     cmd: list[str] = [
         "llama-server",
@@ -216,6 +222,13 @@ def build_llama_server_command(
         cmd.extend(["-ctv", candidate.cache_type_v])
     if candidate.n_cpu_moe is not None:
         cmd.extend(["--n-cpu-moe", str(candidate.n_cpu_moe)])
+    if draft_model_path is not None:
+        cmd.extend(["-md", draft_model_path])
+    if draft_settings is not None:
+        cmd.extend(["--gpu-layers-draft", str(draft_settings.n_gpu_layers_draft)])
+        if draft_settings.n_cpu_moe_draft is not None:
+            cmd.extend(["--n-cpu-moe-draft", str(draft_settings.n_cpu_moe_draft)])
+        cmd.extend(["--draft-max", str(draft_settings.draft_max)])
     if not cpu_only and selected_device_ids:
         cmd.extend(["--main-gpu", str(selected_device_ids[0])])
     return cmd
@@ -230,6 +243,8 @@ def build_preset_ini_section(
     *,
     cpu_only: bool = True,
     selected_device_ids: tuple[int, ...] = (),
+    draft_model_path: str | None = None,
+    draft_settings: MtpDraftSettings | None = None,
 ) -> str:
     lines: list[str] = ["[llama]"]
     lines.append(f"n_ctx = {n_ctx.total}")
@@ -242,6 +257,13 @@ def build_preset_ini_section(
     lines.append(f"cache_type_v = {candidate.cache_type_v}")
     if candidate.n_cpu_moe is not None:
         lines.append(f"n_cpu_moe = {candidate.n_cpu_moe}")
+    if draft_model_path is not None:
+        lines.append(f"model_draft = {draft_model_path}")
+    if draft_settings is not None:
+        lines.append(f"n_gpu_layers_draft = {draft_settings.n_gpu_layers_draft}")
+        if draft_settings.n_cpu_moe_draft is not None:
+            lines.append(f"n_cpu_moe_draft = {draft_settings.n_cpu_moe_draft}")
+        lines.append(f"draft_max = {draft_settings.draft_max}")
     if not cpu_only and selected_device_ids:
         lines.append(f"main_gpu = {selected_device_ids[0]}")
     lines.append("")
@@ -485,6 +507,88 @@ def _failed_validation_to_dict(fv: FailedValidation) -> dict[str, object]:
     }
 
 
+def _mtp_measurement_to_dict(m: MtpMeasurement) -> dict[str, object]:
+    return {
+        "mode": m.mode,
+        "samples_tps": list(m.samples_tps),
+        "median_tps": m.median_tps,
+        "dispersion_tps": m.dispersion_tps,
+    }
+
+
+def _mtp_comparison_to_dict(c: MtpComparison) -> dict[str, object]:
+    return {
+        "benefit": c.benefit,
+        "improvement_pct": c.improvement_pct,
+        "tie_bound_tps": c.tie_bound_tps,
+        "caveat": c.caveat,
+        "off": _mtp_measurement_to_dict(c.off),
+        "on": _mtp_measurement_to_dict(c.on),
+    }
+
+
+def _draft_settings_to_dict(ds: MtpDraftSettings) -> dict[str, object]:
+    d: dict[str, object] = {
+        "n_gpu_layers_draft": ds.n_gpu_layers_draft,
+        "draft_max": ds.draft_max,
+    }
+    if ds.n_cpu_moe_draft is not None:
+        d["n_cpu_moe_draft"] = ds.n_cpu_moe_draft
+    return d
+
+
+def _mtp_profile_to_dict(
+    report: MtpProfileReport,
+    *,
+    n_ctx: NctxComposition | None = None,
+    cpu_only: bool = True,
+    selected_device_ids: tuple[int, ...] = (),
+) -> dict[str, object]:
+    observations_list: list[dict[str, object]] = []
+    for obs in report.observations:
+        o: dict[str, object] = {
+            "main_candidate": _candidate_to_dict(obs.main_candidate),
+            "draft_settings": _draft_settings_to_dict(obs.draft_settings),
+            "disposition": obs.disposition,
+            "note": obs.note,
+        }
+        if obs.comparison is not None:
+            o["comparison"] = _mtp_comparison_to_dict(obs.comparison)
+        if obs.combined_memory is not None:
+            o["combined_memory"] = _memory_evidence_to_dict(obs.combined_memory)
+        observations_list.append(o)
+
+    report_dict: dict[str, object] = {
+        "normal_winner": _validated_candidate_to_dict(report.normal_winner),
+        "draft_fingerprint": _model_to_dict(report.draft_fingerprint),
+        "observations": observations_list,
+        "benefit": report.benefit,
+        "note": report.note,
+    }
+    if report.mtp_main_candidate is not None:
+        report_dict["mtp_main_candidate"] = _candidate_to_dict(report.mtp_main_candidate)
+    if report.recommendation is not None:
+        report_dict["recommendation"] = _mtp_comparison_to_dict(report.recommendation)
+    if (report.recommendation is not None
+            and report.mtp_main_candidate is not None
+            and report.winning_draft_settings is not None):
+        draft_path = str(report.draft_fingerprint.path)
+        if n_ctx is not None:
+            preset = build_preset_ini_section(
+                report.mtp_main_candidate, n_ctx,
+                cpu_only=cpu_only,
+                selected_device_ids=selected_device_ids,
+                draft_model_path=draft_path,
+                draft_settings=report.winning_draft_settings,
+            )
+            report_dict["mtp_preset_ini"] = preset
+        report_dict["mtp_preset"] = {
+            "model_draft": draft_path,
+            "draft_settings": _draft_settings_to_dict(report.winning_draft_settings),
+        }
+    return report_dict
+
+
 def _session_to_dict(spec: SessionSpecification) -> dict[str, object]:
     return {
         "cpu_only": spec.cpu_only,
@@ -560,6 +664,7 @@ def render_export_json(
     model: ModelFingerprint,
     screening_report: ScreeningReport | None = None,
     validation_result: ValidatedRecommendation | NoWinnerReport | None = None,
+    mtp_profile: MtpProfileReport | None = None,
     provenance: LaunchProvenance | None = None,
     include_hashes: bool = False,
 ) -> str:
@@ -581,6 +686,13 @@ def render_export_json(
     if screening_report is not None:
         root["screening"] = _screening_report_to_dict(screening_report)
     root["validation"] = _validation_to_dict(validation_result)
+    if mtp_profile is not None:
+        root["mtp_profile"] = _mtp_profile_to_dict(
+            mtp_profile,
+            n_ctx=session.n_ctx,
+            cpu_only=session.cpu_only,
+            selected_device_ids=session.selected_device_ids,
+        )
 
     candidates_repro, repro_notes = _collect_reproduction_candidates(
         screening_report, validation_result,
@@ -711,6 +823,7 @@ def render_export_markdown(
     model: ModelFingerprint,
     screening_report: ScreeningReport | None = None,
     validation_result: ValidatedRecommendation | NoWinnerReport | None = None,
+    mtp_profile: MtpProfileReport | None = None,
     provenance: LaunchProvenance | None = None,
     include_hashes: bool = False,
 ) -> str:
@@ -941,6 +1054,44 @@ def render_export_markdown(
                              f"[{fv.disposition}] {fv.reason}")
             lines.append("")
 
+    # MTP Profile
+    if mtp_profile is not None:
+        lines.append("## MTP Profile")
+        lines.append("")
+        mp = mtp_profile
+        lines.append(f"- **Benefit:** {mp.benefit}")
+        if mp.mtp_main_candidate is not None:
+            mc = mp.mtp_main_candidate
+            lines.append(f"- **MTP main candidate:** threads={mc.threads}, "
+                         f"batch={mc.batch_size}, ubatch={mc.ubatch_size}")
+        d_path = redact_path(str(mp.draft_fingerprint.path))
+        lines.append(f"- **Draft model:** `{d_path}`")
+        if mp.recommendation is not None:
+            lines.append(f"- **Recommendation:** improvement "
+                         f"{mp.recommendation.improvement_pct:.1f}%")
+            lines.append(f"  - MTP-on median: {mp.recommendation.on.median_tps:.1f} t/s")
+            lines.append(f"  - MTP-off median: {mp.recommendation.off.median_tps:.1f} t/s")
+        else:
+            lines.append("- **Recommendation:** benefit not established")
+            if mp.note:
+                lines.append(f"  - {_markdown_escape(mp.note)}")
+        lines.append("")
+
+        if mp.observations:
+            lines.append("### Observations")
+            lines.append("")
+            for idx, obs in enumerate(mp.observations, 1):
+                lines.append(f"**Observation {idx}:** disposition = {obs.disposition}")
+                ds = obs.draft_settings
+                parts = [f"draft_ngl={ds.n_gpu_layers_draft}",
+                         f"draft_max={ds.draft_max}"]
+                if ds.n_cpu_moe_draft is not None:
+                    parts.append(f"draft_moe={ds.n_cpu_moe_draft}")
+                lines.append(f"- Draft: {', '.join(parts)}")
+                if obs.note:
+                    lines.append(f"- Note: {_markdown_escape(obs.note)}")
+                lines.append("")
+
     # Preset.ini (recommended candidate)
     preset_target: CandidateConfig | None = None
     if validation_result is not None and isinstance(validation_result, ValidatedRecommendation):
@@ -957,6 +1108,25 @@ def render_export_markdown(
         lines.append("")
         lines.append("```ini")
         lines.append(preset)
+        lines.append("```")
+        lines.append("")
+
+    # MTP-specific preset
+    if (mtp_profile is not None
+            and mtp_profile.recommendation is not None
+            and mtp_profile.mtp_main_candidate is not None
+            and mtp_profile.winning_draft_settings is not None):
+        mtp_preset = build_preset_ini_section(
+            mtp_profile.mtp_main_candidate, session.n_ctx,
+            cpu_only=session.cpu_only,
+            selected_device_ids=session.selected_device_ids,
+            draft_model_path=redact_path(str(mtp_profile.draft_fingerprint.path)),
+            draft_settings=mtp_profile.winning_draft_settings,
+        )
+        lines.append("## Preset.ini (MTP recommendation)")
+        lines.append("")
+        lines.append("```ini")
+        lines.append(mtp_preset)
         lines.append("```")
         lines.append("")
 
