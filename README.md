@@ -2,8 +2,10 @@
 
 Benchmark llama.cpp models across candidate configurations by driving `llama-bench` with explicit settings, collecting throughput samples, and journaling results.
 
-> **Status:** issue 12 — Bounded MTP (Multi-Token Prediction) Profile
-> with local draft model, draft GPU layers / n-max / conditional MoE
+> **Status:** issue 13 — Textual TUI (keyboard-driven wizard,
+> review/confirm, live progress, cancellation/resume, results
+> tabs with copy/save). issue 12 — Bounded MTP Profile with
+> local draft model, draft GPU layers / n-max / conditional MoE
 > draft CPU settings grid, draft-memory preflight reservation,
 > separate MTP main candidate selection from normal winner,
 > paired MTP-off/MTP-on evidence, complete-metrics/no-fit policy,
@@ -15,6 +17,53 @@ Benchmark llama.cpp models across candidate configurations by driving `llama-ben
 ```bash
 uv sync --all-extras
 ```
+
+## TUI (Textual User Interface)
+
+Launch the keyboard-driven wizard with:
+
+```bash
+uv run llama-parameter-scout --tui
+```
+
+The TUI provides a four-screen workflow that guides you through session setup, review, execution, and results without requiring command-line flags.
+
+### Workflow
+
+1. **Wizard** — fill in the llama-bench path, model path, journal path, optional MTP draft/server paths, device selection, context composition, search profile and objective, and resource budget overrides. Use Tab/Shift+Tab to navigate, Enable MTP checkbox to reveal draft/server inputs.
+2. **Review** — review the complete session specification before starting. Press F10 or click Start to begin.
+3. **Progress** — live progress shows the current stage (setup, screening, validation, mtp_profile), candidate evaluations, dispositions, errors, and warnings. Press Esc or Ctrl+C to cancel.
+4. **Results** — read-only tabs for Markdown report, preset.ini, and shell commands. Uses existing `Application.export_report_markdown` and reporter builders.
+
+### Key bindings
+
+| Key | Screen | Action |
+|-----|--------|--------|
+| Tab / Shift+Tab | Wizard | Navigate between inputs |
+| F10 | Wizard, Review | Next screen / Start |
+| Esc | Review, Progress | Back / Cancel |
+| Ctrl+C | Progress | Cancel benchmark |
+| F3 | Results | Copy Markdown to clipboard |
+| F4 | Results | Copy preset.ini to clipboard |
+| F5 | Results | Copy shell commands to clipboard |
+| F6 | Results | Save all to files |
+| Esc | Results | Quit |
+
+### Clipboard handling
+
+The TUI tries `pbcopy` (macOS), `wl-copy` (Linux Wayland), `xclip`/`xsel` (Linux X11), or `clip` (Windows). If none is available, a clear fallback message is shown and the Save All (F6) action remains available.
+
+### Cancellation and resume
+
+Cancelling a running benchmark sets the `ExecutionPolicy.cancellation` Event, producing
+a resumable journal session. The results screen shows honest placeholder content when
+benchmark was cancelled before completion. Use `--list-sessions --journal-path <path>`
+from the CLI to inspect journaled sessions.
+
+### Narrow terminals
+
+The wizard and results screens use scrollable containers and reflow to stay navigable
+in terminals as narrow as 40 columns.
 
 ## Single-run CLI
 
@@ -730,6 +779,7 @@ uv run pytest tests/test_issue09.py -v
 uv run pytest tests/test_issue10.py -v
 uv run pytest tests/test_issue11.py -v
 uv run pytest tests/test_issue12.py -v
+uv run pytest tests/test_tui.py -v
 
 # Type check
 uv run mypy src tests

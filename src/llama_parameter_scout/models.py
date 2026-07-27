@@ -499,6 +499,24 @@ class NoWinnerReport:
     pareto_frontier: tuple[ParetoEntry, ...] = ()
 
 
+# ── Progress callback for TUI ────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class ProgressEvent:
+    stage: str
+    message: str
+    candidate: CandidateConfig | None = None
+    disposition: str | None = None
+    index: int | None = None
+    total: int | None = None
+    is_error: bool = False
+    is_warning: bool = False
+
+
+ProgressCallback = Callable[["ProgressEvent"], None]
+
+
 # ── Journal v5 / Session domain ──────────────────────────────────
 
 

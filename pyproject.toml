@@ -3,7 +3,9 @@ name = "llama-parameter-scout"
 version = "0.1.0"
 description = "Benchmark llama.cpp models across candidate configurations"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "textual>=2.0",
+]
 
 [project.scripts]
 llama-parameter-scout = "llama_parameter_scout.cli:main"
@@ -11,6 +13,7 @@ llama-parameter-scout = "llama_parameter_scout.cli:main"
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
+    "pytest-asyncio>=0.24",
     "mypy>=1",
     "ruff>=0.4",
 ]
@@ -24,6 +27,7 @@ markers = [
     "real_binary: tests that invoke a real llama-bench binary",
 ]
 addopts = "-m 'not real_binary'"
+asyncio_mode = "auto"
 
 [tool.mypy]
 strict = true
