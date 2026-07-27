@@ -64,7 +64,7 @@ class TestWriteObservation:
         obs = _make_observation()
         write_observation(path, obs)
         data = json.loads(path.read_text())
-        assert data["version"] == 3
+        assert data["version"] == 4
         assert data["candidate"]["threads"] == 4
         assert data["total_ctx"] == 2048
         assert data["prompt_ctx"] == 512

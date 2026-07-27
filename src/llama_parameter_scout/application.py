@@ -4,18 +4,24 @@ import hashlib
 import json
 import math
 import os
+import subprocess
+import sys
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
-from .journal import write_observation
+from .journal import write_observation, write_outcome
 from .model_inspector import inspect_model
 from .models import (
     BenchmarkObservation,
     BinaryNotFoundError,
     CandidateConfig,
+    CandidateDisposition,
     CandidateError,
+    CandidateOutcome,
     ContextAdvisory,
     ContextExceededWithoutAcknowledgementError,
+    ExecutionPolicy,
     InconsistentNglError,
     InvalidHeadroomRatioError,
     InvalidNctxError,
@@ -29,6 +35,7 @@ from .models import (
     NoAcceleratorSelectedError,
     NonpositiveBudgetError,
     ResourceBudget,
+    ScoutError,
     SessionSetupError,
     SessionSpecification,
     SingleRunRequest,
@@ -38,7 +45,13 @@ from .models import (
     TrainingContextStatus,
     UnknownDeviceError,
 )
-from .runner import ProcessRunner
+from .runner import (
+    ProcessAdapter,
+    ProcessResult,
+    ProcessRunner,
+    ProcessStartError,
+    ProductionProcessAdapter,
+)
 from .toolchain import inspect_toolchain
 from .topology import DetectTopologyFn, detect_topology
 
@@ -46,6 +59,66 @@ from .topology import DetectTopologyFn, detect_topology
 
 DEFAULT_HEADROOM_RATIO = 0.1
 _ESTIMATED_BYTES_PER_TOKEN_PER_PARAM = 0.000075
+
+# ── OOM heuristics ───────────────────────────────────────────────
+
+_OOM_EXIT_CODES = frozenset({-9, 137})
+_OOM_STDERR_TOKENS = frozenset({
+    "killed",
+    "out of memory",
+    "oom-killer",
+    "cuda out of memory",
+    "cuda error: out of memory",
+    "allocator ran out of memory",
+    "cannot allocate memory",
+    "bad_alloc",
+})
+
+
+def _is_oom(returncode: int, stderr_text: str) -> bool:
+    if returncode in _OOM_EXIT_CODES:
+        return True
+    stderr_lower = stderr_text.lower()
+    for token in _OOM_STDERR_TOKENS:
+        if token in stderr_lower:
+            return True
+    return False
+
+
+# ── Safe next actions ────────────────────────────────────────────
+
+_NEXT_ACTION: dict[CandidateDisposition, str] = {
+    "unsupported": "Check binary, model path, and configuration validity.",
+    "pruned": "Adjust candidate parameter bounds and retry.",
+    "not_attempted": "Ensure session is properly set up before launching.",
+    "budget_exhausted": "Increase resource budget or reduce context/model size.",
+    "oom": "Reduce context size, model size, or increase available memory.",
+    "timeout": "Increase candidate timeout or reduce workload.",
+    "crash": "Check binary compatibility, model integrity, and system resources.",
+    "malformed_output": "Verify llama-bench version and output format compatibility.",
+    "cancellation": "The run was cancelled by the user or scheduler.",
+    "systemic_error": "Investigate system state; possible driver or hardware issue.",
+    "completed": "",
+}
+
+
+def _env_for_device(spec: SessionSpecification) -> dict[str, str] | None:
+    if spec.cpu_only or not spec.selected_device_ids:
+        return None
+    device_id = spec.selected_device_ids[0]
+    device = next(
+        (a for a in spec.topology.accelerators if a.device_id == device_id),
+        None,
+    )
+    if device is None:
+        return None
+    if device.backend == "cuda":
+        return {"CUDA_VISIBLE_DEVICES": str(device_id)}
+    if device.backend == "hip":
+        return {"HIP_VISIBLE_DEVICES": str(device_id)}
+    if device.backend == "metal":
+        return None
+    return None
 
 
 def _cache_element_size(cache_type: str) -> int:
@@ -355,10 +428,6 @@ def _estimate_advisory(
     bytes_per_token = int(param_count * _ESTIMATED_BYTES_PER_TOKEN_PER_PARAM * element_size // 2)
     kv_cache_bytes_estimate = bytes_per_token * n_ctx.total
 
-    # Keep RAM and VRAM separate and conservative.
-    # Formula: available_for_kv = min(ram_after_headroom, vram_after_headroom) - model_weight
-    #          then max_tokens = available_for_kv / bytes_per_token.
-    # RAM and VRAM limits are evaluated independently; the tighter bound dominates.
     ram_after_headroom = int(budget.ram_bytes * (1 - budget.headroom_ratio))
     if budget.vram_bytes is not None and budget.vram_bytes > 0:
         vram_after_headroom = int(budget.vram_bytes * (1 - budget.headroom_ratio))
@@ -367,7 +436,6 @@ def _estimate_advisory(
 
     available_for_kv = max(0, min(ram_after_headroom, vram_after_headroom) - model_weight)
 
-    # Determine training-context status and bound
     ctx = model.context_length
     has_conflict = any("conflict" in d.lower() for d in model.diagnostics)
     if ctx is not None and not has_conflict:
@@ -375,7 +443,7 @@ def _estimate_advisory(
         training_context_tokens: int | None = ctx
     elif has_conflict:
         training_context_status = "conflicted"
-        training_context_tokens = ctx  # still record numeric value
+        training_context_tokens = ctx
     else:
         training_context_status = "unknown"
         training_context_tokens = None
@@ -474,14 +542,298 @@ def _check_context_acknowledgement(
         raise ContextExceededWithoutAcknowledgementError(msg)
 
 
+def _make_observation(
+    request: SingleRunRequest,
+    samples: list[float],
+    median: float,
+    dispersion: float,
+    toolchain: ToolchainFingerprint,
+    model: ModelFingerprint,
+    session_spec: SessionSpecification | None = None,
+) -> BenchmarkObservation:
+    return BenchmarkObservation(
+        candidate=request.candidate,
+        total_ctx=request.n_ctx.total,
+        prompt_ctx=request.n_ctx.prompt,
+        generation_ctx=request.n_ctx.generation,
+        depth_ctx=request.n_ctx.depth,
+        samples_tps=tuple(samples),
+        median_tps=median,
+        dispersion_tps=dispersion,
+        binary_path=request.binary_path,
+        binary_source=request.binary_source,
+        model_path=request.model_path,
+        toolchain=toolchain,
+        model=model,
+        session_spec=session_spec,
+    )
+
+
+def _build_launch_env(
+    policy: ExecutionPolicy | None,
+    session_spec: SessionSpecification | None,
+) -> dict[str, str] | None:
+    """Build the subprocess environment.
+
+    Session-selected device visibility variables (e.g. ``CUDA_VISIBLE_DEVICES``)
+    override any conflicting ``ExecutionPolicy.env_overrides`` because device
+    isolation is the higher-priority concern — once a session pins a specific
+    device, that selection must not be overridden by policy-level overrides.
+    """
+    env = None
+    if policy is not None and policy.env_overrides:
+        env = dict(policy.env_overrides)
+    if session_spec is not None:
+        device_env = _env_for_device(session_spec)
+        if device_env:
+            if env is None:
+                env = {}
+            env.update(device_env)
+    return env
+
+
+def _classify_launch(
+    result: ProcessResult,
+    request: SingleRunRequest,
+    toolchain: ToolchainFingerprint,
+    model: ModelFingerprint,
+    session_spec: SessionSpecification | None,
+    policy: ExecutionPolicy | None,
+) -> CandidateOutcome:
+    if result.termination == "timeout":
+        return CandidateOutcome(
+            candidate=request.candidate,
+            disposition="timeout",
+            process_launched=True,
+            diagnostic=(
+                f"Candidate timed out after {policy.candidate_timeout_seconds}s"
+                if policy and policy.candidate_timeout_seconds
+                else "Candidate timed out"
+            ),
+            safe_next_action=_NEXT_ACTION["timeout"],
+        )
+
+    if result.termination == "cancellation":
+        return CandidateOutcome(
+            candidate=request.candidate,
+            disposition="cancellation",
+            process_launched=True,
+            diagnostic="Candidate execution was cancelled.",
+            safe_next_action=_NEXT_ACTION["cancellation"],
+        )
+
+    if result.termination == "oom":
+        return CandidateOutcome(
+            candidate=request.candidate,
+            disposition="oom",
+            process_launched=True,
+            diagnostic=result.stderr[:500] if result.stderr
+            else "Process terminated due to memory pressure.",
+            safe_next_action=_NEXT_ACTION["oom"],
+        )
+
+    if result.returncode != 0:
+        if _is_oom(result.returncode, result.stderr):
+            disp: CandidateDisposition = "oom"
+        else:
+            disp = "crash"
+        return CandidateOutcome(
+            candidate=request.candidate,
+            disposition=disp,
+            process_launched=True,
+            diagnostic=(
+                f"Process exited with code {result.returncode}.\n"
+                f"{result.stderr[:500]}"
+            ),
+            safe_next_action=_NEXT_ACTION[disp],
+        )
+
+    try:
+        samples = _parse_measurements(result.stdout)
+    except MalformedOutputError:
+        return CandidateOutcome(
+            candidate=request.candidate,
+            disposition="malformed_output",
+            process_launched=True,
+            diagnostic=(
+                "Process output could not be parsed as valid benchmark data.\n"
+                f"Raw output:\n{result.stdout[:500]}"
+            ),
+            safe_next_action=_NEXT_ACTION["malformed_output"],
+        )
+
+    median, dispersion = _compute_stats(samples)
+    observation = _make_observation(
+        request, samples, median, dispersion, toolchain, model, session_spec,
+    )
+
+    return CandidateOutcome(
+        candidate=request.candidate,
+        disposition="completed",
+        process_launched=True,
+        diagnostic="",
+        safe_next_action=_NEXT_ACTION["completed"],
+        observation=observation,
+    )
+
+
+def _warmup_and_classify(
+    adapter: ProcessAdapter,
+    argv: list[str],
+    request: SingleRunRequest,
+    policy: ExecutionPolicy | None,
+    session_spec: SessionSpecification | None = None,
+) -> CandidateOutcome:
+    env = _build_launch_env(policy, session_spec)
+
+    try:
+        result = adapter.launch(
+            argv,
+            env=env,
+            timeout_seconds=policy.candidate_timeout_seconds if policy else None,
+            cancellation=policy.cancellation if policy else None,
+            memory_pressure_fn=policy.memory_pressure_fn if policy else None,
+            memory_pressure_backoff_seconds=(
+                policy.memory_pressure_backoff_seconds if policy else 1.0
+            ),
+            memory_pressure_max_backoffs=(
+                policy.memory_pressure_max_backoffs if policy else 3
+            ),
+        )
+    except ProcessStartError as e:
+        return CandidateOutcome(
+            candidate=request.candidate,
+            disposition="unsupported",
+            process_launched=False,
+            diagnostic=f"Warmup process could not be started: {e}",
+            safe_next_action=_NEXT_ACTION["unsupported"],
+        )
+    except Exception as e:
+        return CandidateOutcome(
+            candidate=request.candidate,
+            disposition="systemic_error",
+            process_launched=True,
+            diagnostic=f"Warmup process launch failed: {e}",
+            safe_next_action=_NEXT_ACTION["systemic_error"],
+        )
+
+    if result.termination == "timeout":
+        return CandidateOutcome(
+            candidate=request.candidate,
+            disposition="timeout",
+            process_launched=True,
+            diagnostic=f"Warmup timed out after {policy.candidate_timeout_seconds}s"
+            if policy and policy.candidate_timeout_seconds else "Warmup timed out",
+            safe_next_action=_NEXT_ACTION["timeout"],
+        )
+
+    if result.termination == "cancellation":
+        return CandidateOutcome(
+            candidate=request.candidate,
+            disposition="cancellation",
+            process_launched=True,
+            diagnostic="Warmup was cancelled.",
+            safe_next_action=_NEXT_ACTION["cancellation"],
+        )
+
+    if result.termination == "oom":
+        return CandidateOutcome(
+            candidate=request.candidate,
+            disposition="oom",
+            process_launched=True,
+            diagnostic=result.stderr[:500] if result.stderr
+            else "Warmup terminated due to memory pressure.",
+            safe_next_action=_NEXT_ACTION["oom"],
+        )
+
+    if result.returncode != 0:
+        if _is_oom(result.returncode, result.stderr):
+            disp: CandidateDisposition = "oom"
+        else:
+            disp = "crash"
+        return CandidateOutcome(
+            candidate=request.candidate,
+            disposition=disp,
+            process_launched=True,
+            diagnostic=f"Warmup exited with code {result.returncode}.\n{result.stderr[:500]}",
+            safe_next_action=_NEXT_ACTION[disp],
+        )
+
+    try:
+        _validate_warmup_output(result.stdout)
+    except MalformedOutputError:
+        return CandidateOutcome(
+            candidate=request.candidate,
+            disposition="malformed_output",
+            process_launched=True,
+            diagnostic="Warmup produced unparseable output.",
+            safe_next_action=_NEXT_ACTION["malformed_output"],
+        )
+
+    return CandidateOutcome(
+        candidate=request.candidate,
+        disposition="completed",
+        process_launched=True,
+        diagnostic="",
+        safe_next_action=_NEXT_ACTION["completed"],
+    )
+
+
+def _launch_and_classify(
+    adapter: ProcessAdapter,
+    argv: list[str],
+    request: SingleRunRequest,
+    toolchain: ToolchainFingerprint,
+    model: ModelFingerprint,
+    session_spec: SessionSpecification | None,
+    policy: ExecutionPolicy | None,
+) -> CandidateOutcome:
+    env = _build_launch_env(policy, session_spec)
+
+    try:
+        result = adapter.launch(
+            argv,
+            env=env,
+            timeout_seconds=policy.candidate_timeout_seconds if policy else None,
+            cancellation=policy.cancellation if policy else None,
+            memory_pressure_fn=policy.memory_pressure_fn if policy else None,
+            memory_pressure_backoff_seconds=(
+                policy.memory_pressure_backoff_seconds if policy else 1.0
+            ),
+            memory_pressure_max_backoffs=(
+                policy.memory_pressure_max_backoffs if policy else 3
+            ),
+        )
+    except ProcessStartError as e:
+        return CandidateOutcome(
+            candidate=request.candidate,
+            disposition="unsupported",
+            process_launched=False,
+            diagnostic=f"Process could not be started: {e}",
+            safe_next_action=_NEXT_ACTION["unsupported"],
+        )
+    except Exception as e:
+        return CandidateOutcome(
+            candidate=request.candidate,
+            disposition="systemic_error",
+            process_launched=True,
+            diagnostic=f"Process launch failed: {e}",
+            safe_next_action=_NEXT_ACTION["systemic_error"],
+        )
+
+    return _classify_launch(result, request, toolchain, model, session_spec, policy)
+
+
 class Application:
     def __init__(
         self,
         runner: ProcessRunner,
         detect_topology_fn: DetectTopologyFn | None = None,
+        process_adapter: ProcessAdapter | None = None,
     ) -> None:
         self._runner = runner
         self._detect_topology = detect_topology_fn or detect_topology
+        self._adapter = process_adapter or ProductionProcessAdapter()
 
     def setup_session(
         self,
@@ -567,6 +919,196 @@ class Application:
             fingerprint=spec_fingerprint,
         )
         return spec
+
+    def evaluate_candidate(
+        self,
+        request: SingleRunRequest,
+        *,
+        on_ready: Callable[[ToolchainFingerprint, ModelFingerprint], Any] | None = None,
+        session_spec: SessionSpecification | None = None,
+        policy: ExecutionPolicy | None = None,
+    ) -> CandidateOutcome:
+        try:
+            _validate_request(request)
+        except ScoutError as e:
+            outcome = CandidateOutcome(
+                candidate=request.candidate,
+                disposition="unsupported",
+                process_launched=False,
+                diagnostic=str(e),
+                safe_next_action=_NEXT_ACTION["unsupported"],
+            )
+            _journal_outcome(request.journal_path, outcome, session_spec=session_spec)
+            return outcome
+
+        try:
+            toolchain = inspect_toolchain(self._runner, request.binary_path)
+        except ScoutError as e:
+            outcome = CandidateOutcome(
+                candidate=request.candidate,
+                disposition="unsupported",
+                process_launched=False,
+                diagnostic=str(e),
+                safe_next_action=_NEXT_ACTION["unsupported"],
+            )
+            _journal_outcome(request.journal_path, outcome, session_spec=session_spec)
+            return outcome
+
+        try:
+            model = inspect_model(request.model_path)
+        except ScoutError as e:
+            outcome = CandidateOutcome(
+                candidate=request.candidate,
+                disposition="unsupported",
+                process_launched=False,
+                diagnostic=str(e),
+                safe_next_action=_NEXT_ACTION["unsupported"],
+            )
+            _journal_outcome(request.journal_path, outcome, session_spec=session_spec)
+            return outcome
+
+        if on_ready is not None:
+            on_ready(toolchain, model)
+
+        if session_spec is not None:
+            if session_spec.n_ctx != request.n_ctx:
+                outcome = CandidateOutcome(
+                    candidate=request.candidate,
+                    disposition="unsupported",
+                    process_launched=False,
+                    diagnostic=(
+                        f"Session spec n_ctx ({session_spec.n_ctx}) does not match "
+                        f"request n_ctx ({request.n_ctx})"
+                    ),
+                    safe_next_action=_NEXT_ACTION["unsupported"],
+                )
+                _journal_outcome(request.journal_path, outcome, session_spec=session_spec)
+                return outcome
+            if session_spec.model != model:
+                outcome = CandidateOutcome(
+                    candidate=request.candidate,
+                    disposition="unsupported",
+                    process_launched=False,
+                    diagnostic=(
+                        "Session spec model fingerprint does not match "
+                        "freshly inspected model."
+                    ),
+                    safe_next_action=_NEXT_ACTION["unsupported"],
+                )
+                _journal_outcome(request.journal_path, outcome, session_spec=session_spec)
+                return outcome
+            try:
+                _validate_ngl_consistency(
+                    session_spec.cpu_only,
+                    request.candidate.n_gpu_layers,
+                )
+            except ScoutError as e:
+                outcome = CandidateOutcome(
+                    candidate=request.candidate,
+                    disposition="pruned",
+                    process_launched=False,
+                    diagnostic=str(e),
+                    safe_next_action=_NEXT_ACTION["pruned"],
+                )
+                _journal_outcome(request.journal_path, outcome, session_spec=session_spec)
+                return outcome
+
+            if not session_spec.cpu_only:
+                if ("--split-mode" not in toolchain.supported_flags
+                        or "--main-gpu" not in toolchain.supported_flags):
+                    outcome = CandidateOutcome(
+                        candidate=request.candidate,
+                        disposition="unsupported",
+                        process_launched=False,
+                        diagnostic=(
+                            "Accelerated launch requested but toolchain does not "
+                            "support --split-mode or --main-gpu."
+                        ),
+                        safe_next_action=_NEXT_ACTION["unsupported"],
+                    )
+                    _journal_outcome(request.journal_path, outcome, session_spec=session_spec)
+                    return outcome
+
+                device_id = session_spec.selected_device_ids[0]
+                selected_accelerator = next(
+                    (a for a in session_spec.topology.accelerators
+                     if a.device_id == device_id),
+                    None,
+                )
+                if selected_accelerator is not None:
+                    if selected_accelerator.backend not in toolchain.device_capabilities:
+                        outcome = CandidateOutcome(
+                            candidate=request.candidate,
+                            disposition="unsupported",
+                            process_launched=False,
+                            diagnostic=(
+                                f"Selected device {device_id} requires backend "
+                                f"'{selected_accelerator.backend}' but toolchain "
+                                f"supports: {', '.join(toolchain.device_capabilities)}"
+                            ),
+                            safe_next_action=_NEXT_ACTION["unsupported"],
+                        )
+                        _journal_outcome(request.journal_path, outcome, session_spec=session_spec)
+                        return outcome
+
+        pre_outcome = pre_execution_disposition(request, session_spec)
+        if pre_outcome is not None:
+            _journal_outcome(request.journal_path, pre_outcome, session_spec=session_spec)
+            return pre_outcome
+
+        warmup_argv = _build_argv(request, repetitions=1, session_spec=session_spec)
+        warmup_outcome = _warmup_and_classify(
+            self._adapter, warmup_argv, request, policy, session_spec=session_spec,
+        )
+        if warmup_outcome.disposition != "completed":
+            try:
+                _journal_outcome(request.journal_path, warmup_outcome, session_spec=session_spec)
+            except JournalError as e:
+                return CandidateOutcome(
+                    candidate=request.candidate,
+                    disposition="systemic_error",
+                    process_launched=True,
+                    diagnostic=f"Warmup outcome journal write failed: {e}",
+                    safe_next_action=_NEXT_ACTION["systemic_error"],
+                )
+            return warmup_outcome
+
+        measure_argv = _build_argv(request, repetitions=3, session_spec=session_spec)
+        measure_outcome = _launch_and_classify(
+            self._adapter, measure_argv, request, toolchain, model,
+            session_spec, policy,
+        )
+
+        if measure_outcome.disposition == "completed":
+            assert measure_outcome.observation is not None
+            try:
+                write_observation(
+                    request.journal_path,
+                    measure_outcome.observation,
+                    session_spec=session_spec,
+                )
+            except OSError as e:
+                outcome = CandidateOutcome(
+                    candidate=request.candidate,
+                    disposition="systemic_error",
+                    process_launched=True,
+                    diagnostic=f"Failed to write journal: {e}",
+                    safe_next_action=_NEXT_ACTION["systemic_error"],
+                )
+                return outcome
+        else:
+            try:
+                write_outcome(request.journal_path, measure_outcome, session_spec=session_spec)
+            except OSError as e:
+                return CandidateOutcome(
+                    candidate=request.candidate,
+                    disposition="systemic_error",
+                    process_launched=measure_outcome.process_launched,
+                    diagnostic=f"Failed to write outcome journal: {e}",
+                    safe_next_action=_NEXT_ACTION["systemic_error"],
+                )
+
+        return measure_outcome
 
     def run(
         self,
@@ -674,6 +1216,191 @@ class Application:
             raise JournalError(f"Failed to write journal: {e}") from e
 
         return observation
+
+
+# ── Resource budget gate ─────────────────────────────────────────
+
+
+def _check_resource_budget(
+    session_spec: SessionSpecification,
+    n_ctx: NctxComposition,
+    candidate: CandidateConfig,
+    cache_type_k: str = "f16",
+) -> CandidateOutcome | None:
+    budget = session_spec.budget
+    headroom = budget.headroom_ratio
+    model = session_spec.model
+
+    model_weight = 0
+    if model.shards:
+        model_weight = sum(s.size_bytes for s in model.shards)
+    elif model.path.exists():
+        model_weight = model.path.stat().st_size
+
+    param_count = model.parameter_count or 7_000_000_000
+    element_size = _cache_element_size(cache_type_k)
+    bytes_per_token = int(param_count * _ESTIMATED_BYTES_PER_TOKEN_PER_PARAM * element_size // 2)
+    kv_estimate = bytes_per_token * n_ctx.total
+
+    ram_available = int(budget.ram_bytes * (1 - headroom))
+    unified = session_spec.topology.memory_unified
+
+    if unified or budget.vram_bytes is None:
+        needed = model_weight + kv_estimate
+        if needed > ram_available:
+            return CandidateOutcome(
+                candidate=candidate,
+                disposition="budget_exhausted",
+                process_launched=False,
+                diagnostic=(
+                    f"Estimated resource need ({needed} bytes) exceeds "
+                    f"available RAM ({ram_available} bytes) after headroom."
+                ),
+                safe_next_action=_NEXT_ACTION["budget_exhausted"],
+            )
+    else:
+        vram_available = int(budget.vram_bytes * (1 - headroom))
+        model_in_vram = min(model_weight, vram_available)
+        remaining_weight = model_weight - model_in_vram
+        vram_after_model = vram_available - model_in_vram
+        kv_in_vram = min(kv_estimate, vram_after_model)
+        kv_in_ram = kv_estimate - kv_in_vram
+        ram_needed = remaining_weight + kv_in_ram
+        if ram_needed > ram_available:
+            return CandidateOutcome(
+                candidate=candidate,
+                disposition="budget_exhausted",
+                process_launched=False,
+                diagnostic=(
+                    f"Estimated resource need (model={model_weight}, "
+                    f"KV cache={kv_estimate}) exceeds combined "
+                    f"RAM ({ram_available}) and VRAM ({vram_available}) budget."
+                ),
+                safe_next_action=_NEXT_ACTION["budget_exhausted"],
+            )
+
+    return None
+
+
+def pre_execution_disposition(
+    request: SingleRunRequest,
+    session_spec: SessionSpecification | None = None,
+    skip_candidate: bool = False,
+) -> CandidateOutcome | None:
+    if session_spec is None:
+        return None
+
+    if skip_candidate:
+        return CandidateOutcome(
+            candidate=request.candidate,
+            disposition="not_attempted",
+            process_launched=False,
+            diagnostic="Candidate skipped by session logic.",
+            safe_next_action=_NEXT_ACTION["not_attempted"],
+        )
+
+    budget_outcome = _check_resource_budget(
+        session_spec, request.n_ctx, request.candidate,
+        cache_type_k=request.candidate.cache_type_k,
+    )
+    if budget_outcome is not None:
+        assert budget_outcome.candidate == request.candidate
+        return budget_outcome
+
+    return None
+
+
+# ── Memory pressure detector (stdlib, best-effort) ───────────────
+
+
+def _detect_available_memory_bytes() -> int | None:
+    if sys.platform == "linux":
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        parts = line.split()
+                        return int(parts[1]) * 1024
+        except (OSError, ValueError, IndexError):
+            pass
+    elif sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["vm_stat"],
+                capture_output=True, text=True, timeout=5,
+            )
+            pages_free = 0
+            pages_inactive = 0
+            for line in result.stdout.splitlines():
+                s = line.strip()
+                if s.startswith("Pages free:"):
+                    pages_free = int(s.split()[2].rstrip("."))
+                elif s.startswith("Pages inactive:"):
+                    pages_inactive = int(s.split()[2].rstrip("."))
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            return (pages_free + pages_inactive) * page_size
+        except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+            pass
+    elif sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes  # type: ignore[attr-defined]
+
+            class _MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", wintypes.DWORD),
+                    ("dwMemoryLoad", wintypes.DWORD),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            memory_status = _MEMORYSTATUSEX()
+            memory_status.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(memory_status)):  # type: ignore[attr-defined]
+                return memory_status.ullAvailPhys
+        except (OSError, AttributeError, ImportError):
+            pass
+    return None
+
+
+def make_memory_pressure_fn(
+    session_spec: SessionSpecification | None,
+) -> Callable[[], bool] | None:
+    if session_spec is None:
+        return None
+    budget = session_spec.budget
+    headroom = budget.headroom_ratio
+    threshold_ram = int(budget.ram_bytes * headroom)
+    threshold_ram = min(threshold_ram, session_spec.topology.system_memory_bytes)
+
+    def _is_pressured() -> bool:
+        available = _detect_available_memory_bytes()
+        if available is None:
+            return False
+        if available < threshold_ram:
+            return True
+        return False
+
+    return _is_pressured
+
+
+# ── Journal helper for outcomes ──────────────────────────────────
+
+
+def _journal_outcome(
+    path: Path,
+    outcome: CandidateOutcome,
+    session_spec: SessionSpecification | None = None,
+) -> None:
+    try:
+        write_outcome(path, outcome, session_spec=session_spec)
+    except OSError as e:
+        raise JournalError(f"Failed to write journal: {e}") from e
 
 
 def _validate_nctx_at_setup(n_ctx: NctxComposition) -> None:

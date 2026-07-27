@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Event
 from typing import Literal
 
 # ── Error hierarchy ──────────────────────────────────────────────
@@ -69,6 +71,72 @@ class InconsistentNglError(SessionSetupError):
 
 class ModelFingerprintMismatchError(SessionSetupError):
     """Session spec model fingerprint does not match inspected model."""
+
+
+# ── Execution domain models ─────────────────────────────────────
+
+
+CandidateDisposition = Literal[
+    "unsupported",
+    "pruned",
+    "not_attempted",
+    "budget_exhausted",
+    "oom",
+    "timeout",
+    "crash",
+    "malformed_output",
+    "cancellation",
+    "systemic_error",
+    "completed",
+]
+
+
+@dataclass(frozen=True)
+class ExecutionPolicy:
+    env_overrides: dict[str, str] | None = None
+    candidate_timeout_seconds: float | None = None
+    cancellation: Event | None = None
+    memory_pressure_fn: Callable[[], bool] | None = None
+    memory_pressure_backoff_seconds: float = 1.0
+    memory_pressure_max_backoffs: int = 3
+
+    def __post_init__(self) -> None:
+        if self.candidate_timeout_seconds is not None and self.candidate_timeout_seconds <= 0:
+            raise ValueError("candidate_timeout_seconds must be positive if provided")
+        if self.memory_pressure_backoff_seconds < 0:
+            raise ValueError("memory_pressure_backoff_seconds must be nonnegative")
+        if self.memory_pressure_max_backoffs <= 0:
+            raise ValueError("memory_pressure_max_backoffs must be positive")
+
+
+@dataclass(frozen=True)
+class CandidateOutcome:
+    candidate: CandidateConfig
+    disposition: CandidateDisposition
+    process_launched: bool
+    diagnostic: str
+    safe_next_action: str
+    observation: BenchmarkObservation | None = None
+
+
+@dataclass
+class StopTracker:
+    max_stops: int = 3
+    _consecutive: int = field(default=0, repr=False)
+
+    def record(self, outcome: CandidateOutcome) -> bool:
+        if outcome.disposition in ("systemic_error", "crash", "oom"):
+            self._consecutive += 1
+        else:
+            self._consecutive = 0
+        return self.should_stop
+
+    def reset(self) -> None:
+        self._consecutive = 0
+
+    @property
+    def should_stop(self) -> bool:
+        return self._consecutive >= self.max_stops
 
 
 # ── Session domain models ────────────────────────────────────────

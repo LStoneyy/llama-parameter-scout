@@ -9,6 +9,7 @@ from pathlib import Path
 from .models import (
     Accelerator,
     BenchmarkObservation,
+    CandidateOutcome,
     ContextAdvisory,
     ModelFingerprint,
     ResourceBudget,
@@ -28,6 +29,22 @@ def write_observation(
     data = _observation_to_dict(observation)
     if session_spec is not None:
         data["session_spec"] = _session_spec_to_dict(session_spec)
+    _atomic_write_json(path, data)
+
+
+def write_outcome(
+    path: Path,
+    outcome: CandidateOutcome,
+    session_spec: SessionSpecification | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = _outcome_to_dict(outcome)
+    if session_spec is not None:
+        data["session_spec"] = _session_spec_to_dict(session_spec)
+    _atomic_write_json(path, data)
+
+
+def _atomic_write_json(path: Path, data: dict[str, object]) -> None:
     fd, tmp_path = tempfile.mkstemp(
         dir=str(path.parent),
         prefix=f".{path.name}.",
@@ -49,7 +66,9 @@ def write_observation(
 
 def _observation_to_dict(obs: BenchmarkObservation) -> dict[str, object]:
     return {
-        "version": 3,
+        "version": 4,
+        "disposition": "completed",
+        "process_launched": True,
         "candidate": asdict(obs.candidate),
         "total_ctx": obs.total_ctx,
         "prompt_ctx": obs.prompt_ctx,
@@ -65,6 +84,34 @@ def _observation_to_dict(obs: BenchmarkObservation) -> dict[str, object]:
         "toolchain": _toolchain_to_dict(obs.toolchain),
         "model": _model_to_dict(obs.model),
     }
+
+
+def _outcome_to_dict(outcome: CandidateOutcome) -> dict[str, object]:
+    d: dict[str, object] = {
+        "version": 4,
+        "disposition": outcome.disposition,
+        "process_launched": outcome.process_launched,
+        "diagnostic": outcome.diagnostic,
+        "safe_next_action": outcome.safe_next_action,
+        "candidate": asdict(outcome.candidate),
+    }
+    if outcome.observation is not None:
+        obs = outcome.observation
+        d["total_ctx"] = obs.total_ctx
+        d["prompt_ctx"] = obs.prompt_ctx
+        d["generation_ctx"] = obs.generation_ctx
+        d["depth_ctx"] = obs.depth_ctx
+        if obs.samples_tps:
+            d["samples_tps"] = list(obs.samples_tps)
+            d["median_tps"] = obs.median_tps
+            d["dispersion_tps"] = obs.dispersion_tps
+            d["n_measurements"] = len(obs.samples_tps)
+        d["binary_path"] = str(obs.binary_path)
+        d["binary_source"] = obs.binary_source
+        d["model_path"] = str(obs.model_path)
+        d["toolchain"] = _toolchain_to_dict(obs.toolchain)
+        d["model"] = _model_to_dict(obs.model)
+    return d
 
 
 def _session_spec_to_dict(spec: SessionSpecification) -> dict[str, object]:

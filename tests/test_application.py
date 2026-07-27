@@ -350,7 +350,7 @@ class TestApplication:
 
         assert valid_request.journal_path.exists()
         journal = json.loads(valid_request.journal_path.read_text())
-        assert journal["version"] == 3
+        assert journal["version"] == 4
         assert journal["candidate"]["threads"] == 4
         assert journal["total_ctx"] == 2048
         assert journal["samples_tps"] == [45.5, 44.8, 45.3]
