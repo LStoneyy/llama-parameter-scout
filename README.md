@@ -2,6 +2,30 @@
 
 Benchmark llama.cpp models across candidate configurations by driving `llama-bench` with explicit settings, collecting throughput samples, and journaling results.
 
+## Table of contents
+
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [TUI (Textual User Interface)](#tui-textual-user-interface)
+- [Single-run CLI](#single-run-cli)
+- [Session Specification](#session-specification)
+- [Search / Screening](#search--screening)
+- [Validation (issue 07)](#validation-issue-07)
+- [Resource Budget (issue 08)](#resource-budget-issue-08)
+- [Export (issue 10)](#export-issue-10)
+- [MTP (Multi-Token Prediction) comparison](#mtp-multi-token-prediction-comparison)
+- [MTP Profile (issue 12)](#mtp-profile-issue-12)
+- [Tests](#tests)
+- [GPU and backend support matrix](#gpu-and-backend-support-matrix)
+- [Network safety](#network-safety)
+- [Troubleshooting](#troubleshooting)
+- [Result interpretation](#result-interpretation)
+- [Journal schema (v5)](#journal-schema-v5)
+- [Error handling](#error-handling)
+- [Candidate lifecycle](#candidate-lifecycle)
+- [CLI output](#cli-output)
+- [Developer commands](#developer-commands)
+
 ## Installation
 
 ### via pipx (PyPI)
