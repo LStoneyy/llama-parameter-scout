@@ -2,8 +2,8 @@
 
 Benchmark llama.cpp models across candidate configurations by driving `llama-bench` with explicit settings, collecting throughput samples, and journaling results.
 
-> **Status:** issue 04 - candidate execution classification, process-tree containment, outcome dispositions.
-> No adaptive search, full report rendering, or TUI yet.
+> **Status:** issue 05 - screen and rank core candidates across Quick, Standard, and Thorough profiles.
+> No GPU/KV/MoE pairing, resource-budget recommendations, resume, or TUI yet.
 
 ## Setup
 
@@ -153,6 +153,75 @@ The advisory includes a note stating clearly that it is an estimate, not a teste
 
 The session specification fingerprint is a SHA-256 hash of the device selection, context composition, budget, and topology parameters. It is deterministic and included in the journal for reproducibility.
 
+## Search / Screening (Issue 05)
+
+The `search` module provides a deterministic staged candidate search that evaluates multiple candidate configurations in a single pass:
+
+### Search Profiles
+
+Three built-in profiles with documented finite budgets:
+
+| Profile | `max_attempts` | `min_repetitions` | `max_repetitions_per_candidate` | `tie_bound_coefficient` | `dispersion_threshold` |
+|---------|---------------|-------------------|-------------------------------|------------------------|----------------------|
+| Quick   | 8            | 3                 | 5                             | 0.05                   | 0.15                 |
+| Standard| 20           | 4                 | 6                             | 0.03                   | 0.12                 |
+| Thorough| 40           | 5                 | 8                             | 0.02                   | 0.10                 |
+
+All profiles use a screening context of `NctxComposition(total=512, prompt=128, generation=256, depth=128)` — a short-context evaluation before any full-context validation.
+
+### Screening flow
+
+1. **Baseline** — the supplied base `CandidateConfig` is evaluated first with `min_repetitions`.
+2. **Core grid** — candidates are generated varying threads, batch_size, and ubatch_size while keeping `n_gpu_layers`, `flash_attn`, `cache_type_k`, and `cache_type_v` fixed.
+3. **Evaluation** — each candidate receives a short-context screening run. Failed candidates (OOM, crash, timeout, budget exhaustion, malformed output, unsupported, cancellation) are recorded with a disposition and reason. Duplicates of the base candidate are noted as `matches_baseline` and not re-evaluated. Every disposition has a non-empty reason.
+4. **Dominance pruning** — candidates strictly dominated in both PP and TG (Pareto: >= in both and > in at least one) are removed from the ranked list and receive a `dominance_pruned` disposition.
+5. **Adaptive repetitions** — if any surviving candidate has relative dispersion above the profile's `dispersion_threshold`, additional single-repetition evaluations are added until either the dispersion falls below the threshold, the candidate reaches `max_repetitions_per_candidate`, or the total `max_attempts` budget is exhausted. If the leading survivors are tied (within the objective-specific tie bound), extra evaluations are also added to separate them. All observations are pooled for aggregate scoring.
+5. **Scoring** — PP and TG scores are normalized relative to baseline: `pp_score = candidate_pp / baseline_pp`. The Balanced score is the geometric mean: `sqrt(pp_score * tg_score)`.
+6. **Ranking** — survivors are sorted by the selected objective (`pp`, `tg`, or `balanced`).
+7. **Tie-breaking** — ties are identified using an objective-specific dynamic bound based on observed relative dispersion: PP dispersion for PP objective, TG dispersion for TG objective, average of both for Balanced. Tie order: stability (lower pooled relative dispersion), then comparable memory (lower known memory wins; unknown memory cannot win), then simpler flags (fewer threads, then smaller batch_size, then smaller ubatch_size).
+8. **Provisional leader** — the top-ranked candidate is reported with the label: `⚠ Screening evidence only — not validated at requested context`.
+9. **Zero survivors** — if all grid candidates fail, the report has an empty shortlist, no leader, and each failure includes a reason.
+
+### Usage via Application
+
+```python
+from llama_parameter_scout.application import Application
+from llama_parameter_scout.search import STANDARD_PROFILE
+from llama_parameter_scout.models import SingleRunRequest
+
+app = Application(runner)
+report = app.screen_candidates(
+    request,
+    profile=STANDARD_PROFILE,
+)
+
+# report.survivors — ranked list of RankedCandidate
+# report.leader — ProvisionalLeader with scores and screening-evidence label
+# report.baseline_disposition — baseline ScreeningResult
+# report.grid_dispositions — every grid candidate's ScreeningResult (survivor or failure)
+```
+
+### Injectable evaluator
+
+The `ScreeningEvaluator` protocol allows injecting a custom evaluator for testing:
+
+```python
+from llama_parameter_scout.search import ScreeningEvaluator, screen
+
+class MyEvaluator:
+    def __call__(self, candidate, n_ctx, repetitions) -> ScreeningResult:
+        ...
+
+report = screen(
+    base_candidate=base,
+    profile=QUICK_PROFILE,
+    evaluator=MyEvaluator(),
+    screening_n_ctx=SCREENING_N_CTX,
+)
+```
+
+See `tests/test_search.py` for comprehensive deterministic fake-evaluator tests covering pruning, ranking, tie-breaking, budget enforcement, adaptive repetitions, and zero-survivor handling.
+
 ## Tests
 
 ```bash
@@ -160,6 +229,7 @@ The session specification fingerprint is a SHA-256 hash of the device selection,
 uv run pytest -v
 
 # Targeted files
+uv run pytest tests/test_search.py -v
 uv run pytest tests/test_session.py -v
 uv run pytest tests/test_topology.py -v
 uv run pytest tests/test_application.py -v

@@ -292,3 +292,104 @@ class BenchmarkObservation:
     toolchain: ToolchainFingerprint
     model: ModelFingerprint
     session_spec: SessionSpecification | None = None
+
+
+# ── Search / Screening domain models ──────────────────────────────
+
+
+ScreeningDisposition = Literal[
+    "survived",
+    "pruned",
+    "dominance_pruned",
+    "budget_exhausted",
+    "oom",
+    "timeout",
+    "crash",
+    "malformed_output",
+    "systemic_error",
+    "unsupported",
+    "cancellation",
+    "not_attempted",
+    "matches_baseline",
+]
+
+
+@dataclass(frozen=True)
+class SearchProfile:
+    label: str
+    max_attempts: int
+    min_repetitions: int
+    max_repetitions_per_candidate: int
+    tie_bound_coefficient: float
+    dispersion_threshold: float
+
+    def __post_init__(self) -> None:
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
+        if self.min_repetitions < 3:
+            raise ValueError("min_repetitions must be >= 3 (user story 31)")
+        if self.max_repetitions_per_candidate < self.min_repetitions:
+            raise ValueError(
+                "max_repetitions_per_candidate must be >= min_repetitions"
+            )
+        if not 0.0 <= self.tie_bound_coefficient <= 1.0:
+            raise ValueError("tie_bound_coefficient must be in [0.0, 1.0]")
+        if self.dispersion_threshold < 0:
+            raise ValueError("dispersion_threshold must be >= 0")
+
+
+@dataclass(frozen=True)
+class ScreeningObservation:
+    candidate: CandidateConfig
+    pp_samples: tuple[float, ...]
+    tg_samples: tuple[float, ...]
+    memory_bytes: int | None = None
+
+
+@dataclass(frozen=True)
+class ScreeningResult:
+    candidate: CandidateConfig
+    success: bool
+    disposition: ScreeningDisposition = "survived"
+    reason: str = ""
+    observation: ScreeningObservation | None = None
+
+
+@dataclass(frozen=True)
+class RankedCandidate:
+    candidate: CandidateConfig
+    pp_score: float
+    tg_score: float
+    balanced: float
+    pp_median: float
+    tg_median: float
+    pp_relative_dispersion: float
+    tg_relative_dispersion: float
+    memory_bytes: int | None = None
+    total_repetitions: int = 0
+    tie_break: str = ""
+
+
+@dataclass(frozen=True)
+class ProvisionalLeader:
+    candidate: CandidateConfig
+    objective: str
+    pp_score: float
+    tg_score: float
+    balanced: float
+    pp_median: float
+    tg_median: float
+    label: str = "Screening evidence only - not validated at requested context"
+
+
+@dataclass(frozen=True)
+class ScreeningReport:
+    profile: SearchProfile
+    baseline_disposition: ScreeningResult
+    grid_dispositions: tuple[ScreeningResult, ...]
+    adaptive_dispositions: tuple[ScreeningResult, ...] = ()
+    survivors: tuple[RankedCandidate, ...] = ()
+    leader: ProvisionalLeader | None = None
+    attempts_used: int = 0
+    objective: str = "balanced"
+    disposition_summary: str = ""

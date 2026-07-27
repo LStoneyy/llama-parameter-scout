@@ -8,7 +8,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .journal import write_observation, write_outcome
 from .model_inspector import inspect_model
@@ -36,6 +36,11 @@ from .models import (
     NonpositiveBudgetError,
     ResourceBudget,
     ScoutError,
+    ScreeningDisposition,
+    ScreeningObservation,
+    ScreeningReport,
+    ScreeningResult,
+    SearchProfile,
     SessionSetupError,
     SessionSpecification,
     SingleRunRequest,
@@ -52,6 +57,8 @@ from .runner import (
     ProcessStartError,
     ProductionProcessAdapter,
 )
+from .search import SCREENING_N_CTX, ScreeningEvaluator
+from .search import screen as _search_screen
 from .toolchain import inspect_toolchain
 from .topology import DetectTopologyFn, detect_topology
 
@@ -824,6 +831,194 @@ def _launch_and_classify(
     return _classify_launch(result, request, toolchain, model, session_spec, policy)
 
 
+def _build_workload_session_spec(
+    base_spec: SessionSpecification,
+    workload_nctx: NctxComposition,
+) -> SessionSpecification:
+    budget = ResourceBudget(
+        ram_bytes=base_spec.budget.ram_bytes,
+        vram_bytes=base_spec.budget.vram_bytes,
+        headroom_ratio=base_spec.budget.headroom_ratio,
+    )
+    advisory = _estimate_advisory(base_spec.model, workload_nctx, budget)
+    spec = SessionSpecification(
+        topology=base_spec.topology,
+        cpu_only=base_spec.cpu_only,
+        selected_device_ids=base_spec.selected_device_ids,
+        n_ctx=workload_nctx,
+        budget=budget,
+        advisory=advisory,
+        model=base_spec.model,
+        acknowledged=base_spec.acknowledged,
+        fingerprint="",
+    )
+    fp = _compute_session_fingerprint(spec)
+    return SessionSpecification(
+        topology=base_spec.topology,
+        cpu_only=base_spec.cpu_only,
+        selected_device_ids=base_spec.selected_device_ids,
+        n_ctx=workload_nctx,
+        budget=budget,
+        advisory=advisory,
+        model=base_spec.model,
+        acknowledged=base_spec.acknowledged,
+        fingerprint=fp,
+    )
+
+
+def _screening_preflight(
+    request: SingleRunRequest,
+    toolchain: ToolchainFingerprint,
+    model: ModelFingerprint,
+    session_spec: SessionSpecification | None,
+) -> ScreeningResult | None:
+    if session_spec is None:
+        return None
+
+    if session_spec.model != model:
+        return ScreeningResult(
+            candidate=request.candidate, success=False,
+            disposition="unsupported",
+            reason=(
+                "Session spec model fingerprint does not match "
+                "freshly inspected model."
+            ),
+        )
+
+    try:
+        _validate_ngl_consistency(session_spec.cpu_only, request.candidate.n_gpu_layers)
+    except ScoutError as e:
+        return ScreeningResult(
+            candidate=request.candidate, success=False,
+            disposition="pruned", reason=str(e),
+        )
+
+    if not session_spec.cpu_only:
+        if ("--split-mode" not in toolchain.supported_flags
+                or "--main-gpu" not in toolchain.supported_flags):
+            return ScreeningResult(
+                candidate=request.candidate, success=False,
+                disposition="unsupported",
+                reason="Accelerated launch requested but toolchain does not "
+                       "support --split-mode or --main-gpu.",
+            )
+        device_id = session_spec.selected_device_ids[0]
+        selected_accelerator = next(
+            (a for a in session_spec.topology.accelerators
+             if a.device_id == device_id),
+            None,
+        )
+        if selected_accelerator is not None:
+            if selected_accelerator.backend not in toolchain.device_capabilities:
+                return ScreeningResult(
+                    candidate=request.candidate, success=False,
+                    disposition="unsupported",
+                    reason=f"Selected device {device_id} requires backend "
+                           f"'{selected_accelerator.backend}' but toolchain "
+                           f"supports: {', '.join(toolchain.device_capabilities)}",
+                )
+
+    pre_outcome = pre_execution_disposition(request, session_spec)
+    if pre_outcome is not None:
+        return ScreeningResult(
+            candidate=request.candidate, success=False,
+            disposition=cast("ScreeningDisposition", pre_outcome.disposition),
+            reason=pre_outcome.diagnostic,
+        )
+
+    return None
+
+
+def _run_screening_workload(
+    app: Application,
+    request: SingleRunRequest,
+    candidate: CandidateConfig,
+    workload_nctx: NctxComposition,
+    repetitions: int,
+    toolchain: ToolchainFingerprint,
+    model: ModelFingerprint,
+    base_session_spec: SessionSpecification | None,
+    policy: ExecutionPolicy | None,
+) -> ScreeningResult:
+    wr = SingleRunRequest(
+        binary_path=request.binary_path,
+        model_path=request.model_path,
+        journal_path=request.journal_path,
+        n_ctx=workload_nctx,
+        candidate=candidate,
+        binary_source=request.binary_source,
+    )
+
+    workload_spec: SessionSpecification | None = None
+    if base_session_spec is not None:
+        workload_spec = _build_workload_session_spec(base_session_spec, workload_nctx)
+
+    preflight = _screening_preflight(wr, toolchain, model, workload_spec)
+    if preflight is not None:
+        return preflight
+
+    env = _build_launch_env(policy, workload_spec)
+
+    warmup_argv = _build_argv(wr, repetitions=1, session_spec=workload_spec)
+    warmup_outcome = _warmup_and_classify(
+        app._adapter, warmup_argv, wr, policy, session_spec=workload_spec,
+    )
+    if warmup_outcome.disposition != "completed":
+        return ScreeningResult(
+            candidate=candidate, success=False,
+            disposition=warmup_outcome.disposition,
+            reason=warmup_outcome.diagnostic or "Warmup failed",
+        )
+
+    measure_argv = _build_argv(wr, repetitions=repetitions, session_spec=workload_spec)
+    try:
+        result = app._adapter.launch(
+            measure_argv,
+            env=env,
+            timeout_seconds=policy.candidate_timeout_seconds if policy else None,
+            cancellation=policy.cancellation if policy else None,
+            memory_pressure_fn=policy.memory_pressure_fn if policy else None,
+            memory_pressure_backoff_seconds=(
+                policy.memory_pressure_backoff_seconds if policy else 1.0
+            ),
+            memory_pressure_max_backoffs=(
+                policy.memory_pressure_max_backoffs if policy else 3
+            ),
+        )
+    except ProcessStartError as e:
+        return ScreeningResult(
+            candidate=candidate, success=False,
+            disposition="unsupported",
+            reason=f"Process could not be started: {e}",
+        )
+    except Exception as e:
+        return ScreeningResult(
+            candidate=candidate, success=False,
+            disposition="systemic_error",
+            reason=f"Process launch failed: {e}",
+        )
+
+    outcome = _classify_launch(
+        result, wr, toolchain, model, workload_spec, policy,
+    )
+    if outcome.disposition != "completed" or outcome.observation is None:
+        return ScreeningResult(
+            candidate=candidate, success=False,
+            disposition=cast("ScreeningDisposition", outcome.disposition),
+            reason=outcome.diagnostic or f"Screening run failed: {outcome.disposition}",
+        )
+    obs = outcome.observation
+    return ScreeningResult(
+        candidate=candidate,
+        success=True,
+        observation=ScreeningObservation(
+            candidate=candidate,
+            pp_samples=tuple(obs.samples_tps),
+            tg_samples=tuple(obs.samples_tps),
+        ),
+    )
+
+
 class Application:
     def __init__(
         self,
@@ -1109,6 +1304,122 @@ class Application:
                 )
 
         return measure_outcome
+
+    def screen_candidates(
+        self,
+        request: SingleRunRequest,
+        profile: SearchProfile,
+        *,
+        evaluator: ScreeningEvaluator | None = None,
+        session_spec: SessionSpecification | None = None,
+        policy: ExecutionPolicy | None = None,
+        objective: str = "balanced",
+    ) -> ScreeningReport:
+        _validate_request(request)
+
+        if evaluator is not None:
+            return _search_screen(
+                base_candidate=request.candidate,
+                profile=profile,
+                evaluator=evaluator,
+                screening_n_ctx=SCREENING_N_CTX,
+                objective=objective,
+            )
+
+        # Inspect toolchain and model once, before the search.
+        try:
+            toolchain = inspect_toolchain(self._runner, request.binary_path)
+        except ScoutError as e:
+            return ScreeningReport(
+                profile=profile,
+                baseline_disposition=ScreeningResult(
+                    candidate=request.candidate, success=False,
+                    disposition="unsupported", reason=str(e),
+                ),
+                grid_dispositions=(),
+                survivors=(),
+                leader=None,
+                attempts_used=0,
+                objective=objective,
+                disposition_summary="Toolchain inspection failed; no evaluations attempted",
+            )
+
+        try:
+            model = inspect_model(request.model_path)
+        except ScoutError as e:
+            return ScreeningReport(
+                profile=profile,
+                baseline_disposition=ScreeningResult(
+                    candidate=request.candidate, success=False,
+                    disposition="unsupported", reason=str(e),
+                ),
+                grid_dispositions=(),
+                survivors=(),
+                leader=None,
+                attempts_used=0,
+                objective=objective,
+                disposition_summary="Model inspection failed; no evaluations attempted",
+            )
+
+        if session_spec is not None and session_spec.model != model:
+            return ScreeningReport(
+                profile=profile,
+                baseline_disposition=ScreeningResult(
+                    candidate=request.candidate, success=False,
+                    disposition="unsupported",
+                    reason="Session spec model fingerprint does not match freshly inspected model.",
+                ),
+                grid_dispositions=(),
+                survivors=(),
+                leader=None,
+                attempts_used=0,
+                objective=objective,
+                disposition_summary="Model fingerprint mismatch; no evaluations attempted",
+            )
+
+        def _production_evaluator(
+            candidate: CandidateConfig,
+            n_ctx: NctxComposition,
+            repetitions: int,
+        ) -> ScreeningResult:
+            pp_nctx = NctxComposition(
+                total=n_ctx.prompt + 2, prompt=n_ctx.prompt, generation=1, depth=1,
+            )
+            tg_nctx = NctxComposition(
+                total=n_ctx.generation + 2, prompt=1, generation=n_ctx.generation, depth=1,
+            )
+
+            pp_result = _run_screening_workload(
+                self, request, candidate, pp_nctx, repetitions,
+                toolchain, model, session_spec, policy,
+            )
+            if not pp_result.success or pp_result.observation is None:
+                return pp_result
+
+            tg_result = _run_screening_workload(
+                self, request, candidate, tg_nctx, repetitions,
+                toolchain, model, session_spec, policy,
+            )
+            if not tg_result.success or tg_result.observation is None:
+                return tg_result
+
+            return ScreeningResult(
+                candidate=candidate,
+                success=True,
+                observation=ScreeningObservation(
+                    candidate=candidate,
+                    pp_samples=tuple(pp_result.observation.pp_samples),
+                    tg_samples=tuple(tg_result.observation.tg_samples),
+                ),
+            )
+
+        return _search_screen(
+            base_candidate=request.candidate,
+            profile=profile,
+            evaluator=_production_evaluator,
+            screening_n_ctx=SCREENING_N_CTX,
+            objective=objective,
+        )
 
     def run(
         self,
