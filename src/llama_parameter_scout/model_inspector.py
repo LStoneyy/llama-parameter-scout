@@ -228,6 +228,25 @@ def inspect_model(path: Path | str) -> ModelFingerprint:
                     diagnostics.append(f"Path appears to be on a network mount: {shard_path}")
                 network_mount_detected = True
 
+    if len(shards) > 1:
+        shard_ctx_values: set[int | None] = set()
+        for s in shards:
+            if s.path == path:
+                meta = metadata
+            else:
+                meta = _read_gguf_metadata(s.path)
+            raw = meta.get(ctx_key)
+            if isinstance(raw, (int, float)):
+                shard_ctx_values.add(int(raw))
+            else:
+                shard_ctx_values.add(None)
+        if len(shard_ctx_values) > 1:
+            diagnostics.append(
+                f"Shard context length conflict: values {shard_ctx_values} "
+                f"across shards for {ctx_key}. Treating as unknown."
+            )
+            ctx_length = None
+
     return ModelFingerprint(
         path=path,
         architecture=arch,

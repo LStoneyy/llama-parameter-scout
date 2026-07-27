@@ -2,8 +2,8 @@
 
 Benchmark llama.cpp models across candidate configurations by driving `llama-bench` with explicit settings, collecting throughput samples, and journaling results.
 
-> **Status:** issue 02 - binary resolution, toolchain fingerprint, model inspection.
-> No system/device detection, adaptive search, full report rendering, TUI, or timeout/resource containment yet.
+> **Status:** issue 03 - topology detection, device selection, session specification, context advisory.
+> No adaptive search, full report rendering, TUI, or timeout/resource containment yet.
 
 ## Setup
 
@@ -41,17 +41,61 @@ uv run llama-parameter-scout \
 
 Only regular executable files are accepted during search. On Windows both `llama-bench.exe` and `llama-bench` are tried.
 
+### Device selection
+
+The CLI requires an explicit device choice when accelerators are detected:
+
+- **`--cpu-only`** — run on CPU only, even if accelerators (GPUs) are present.
+- **`--device <id>`** — select a specific accelerator by device ID (0, 1, etc.).
+
+If no accelerators are detected, CPU-only is automatic and no flag is required. If accelerators exist and no flag is given, an error is raised.
+
+`--cpu-only` and `--device` are mutually exclusive.
+
+### Session specification and confirmation
+
+Before running the benchmark, the CLI builds a **Session Specification** containing the detected system topology, selected device, resource budget, and a context advisory. The full spec is printed for review:
+
+```
+Session Specification:
+  CPU-only: True
+  Context: 2048 tokens (prompt=512, gen=1024, depth=512)
+  Resource Budget:
+    RAM: 17179869184 bytes (16.0 GB)
+    VRAM: unified with RAM
+    Headroom: 10%
+  Context Advisory:
+    Likely-fit range: 10000 - 20000 tokens
+    Uncertain maximum: 22000 tokens
+    Note: This is an estimate ...
+  Fingerprint: <sha256>
+```
+
+Use **`--yes`** to skip the confirmation prompt (for scripting). Without `--yes`, the CLI prints the spec and waits for user confirmation.
+
+### Context warning
+
+When the requested context exceeds the model's known training context, or the model's context length is unknown or internally conflicted, a warning is printed and explicit acknowledgement is required before proceeding.
+
+### Budget overrides
+
+Default budgets use the detected system memory (and zero VRAM for discrete GPUs). Override with:
+
+- **`--budget-ram <bytes>`** — override the RAM budget for the context advisory.
+- **`--budget-vram <bytes>`** — override the VRAM budget for the context advisory.
+
 ### What happens
 
 1. **Binary resolution:** the executable is located via the precedence chain above.
 2. **Toolchain fingerprint:** `llama-bench --version` is parsed for version, supported flags, device backends, and supported output formats. `--help` is verified to confirm the binary is responsive.
 3. **Model inspection:** the GGUF file header is read to extract architecture, parameter count, training context, and quantization type. Split shard sets (e.g. `model-00001-of-00003.gguf`) are resolved and fingerprinted with path, size, mtime, and SHA-256 digest. Symlinks and network mounts produce warnings. Remote URLs, mmproj files, and LoRA adapters (by extension or GGUF metadata) are rejected.
-4. **Preflight validation:** binary must exist and be executable; model must exist; n_ctx must be > 0, components nonnegative and sum exactly to total; candidate values must be in range.
-5. **Warmup:** one `llama-bench` invocation (`-r 1`), output validated as parseable JSON/JSONL.
-6. **Measurement:** second `llama-bench` invocation (`-r 3`), output parsed for `samples_ts` (requires at least 3 finite positive throughput samples).
-7. **Statistics:** median throughput and population standard deviation (dispersion).
-8. **Atomic journal:** a versioned JSON file is written atomically (write-temp + fsync + `os.replace`).
-9. **Terminal output:** toolchain fingerprint and model fingerprint printed before warmup, followed by measurement results and journal path.
+4. **Session setup:** system topology is detected (CPU count, system memory, accelerator count and type, unified vs discrete memory). Device selection is validated, a resource budget is built, and a context advisory is estimated. The full specification is printed and requires confirmation (unless `--yes`).
+5. **Preflight validation:** binary must exist and be executable; model must exist; n_ctx must be > 0, components nonnegative and sum exactly to total; candidate values must be in range.
+6. **Warmup:** one `llama-bench` invocation (`-r 1`), output validated as parseable JSON/JSONL.
+7. **Measurement:** second `llama-bench` invocation (`-r 3`), output parsed for `samples_ts` (requires at least 3 finite positive throughput samples).
+8. **Statistics:** median throughput and population standard deviation (dispersion).
+9. **Atomic journal:** a versioned JSON file is written atomically (write-temp + fsync + `os.replace`).
+10. **Terminal output:** session specification, toolchain fingerprint and model fingerprint printed before warmup, followed by measurement results and journal path.
 
 **Dispersion** is defined as the population standard deviation of the per-repetition throughput samples (tokens/second).
 
@@ -60,6 +104,7 @@ Only regular executable files are accepted during search. On Windows both `llama
 - `-p <n_prompt>`, `-n <n_gen>`, `-d <n_depth>`: context composition (n_ctx total is validated explicitly but not passed as a separate flag; depth is passed directly as `-d`)
 - `-t <threads>`, `-b <batch>`, `-ub <ubatch>`: compute parameters
 - `-ngl <layers>`: GPU offload
+- `--main-gpu <id>`: selected accelerator device (when a specific device is chosen)
 - `-fa on|off`: flash attention
 - `-ctk <type>`, `-ctv <type>`: KV cache types
 - `-o json`: machine-readable output
@@ -78,14 +123,47 @@ Only regular executable files are accepted during search. On Windows both `llama
 
 GGUF versions 2 and 3 are supported. Missing optional metadata fields (parameter count, context length, quantization) are recorded as unknown with a diagnostic rather than causing rejection.
 
+## Session Specification
+
+The session specification bundles the detected system topology, device selection, context composition, resource budget, context advisory, and a deterministic fingerprint into a single immutable object.
+
+### Resource budget defaults
+
+| Parameter | Default |
+|-----------|---------|
+| RAM | Detected system memory (or 8 GB fallback) |
+| VRAM (discrete) | 0 bytes (must be overridden explicitly with `--budget-vram`) |
+| VRAM (unified) | Unified with RAM (no separate tracking) |
+| Headroom | 10% of total budget |
+
+Default budgets include a configurable headroom ratio to account for operating system and framework overhead. The headroom is subtracted from the total available budget before computing the context advisory.
+
+### Context advisory
+
+The advisory estimates a likely-fit context range based on:
+
+- **Model weight footprint:** total size of all model shard files, with a 10% runtime overhead.
+- **KV cache estimate:** computed from parameter count, cache type element size, and a heuristic bytes-per-token factor.
+- **Resource budget:** total available RAM/VRAM after subtracting headroom.
+- **Uncertain maximum:** the budget minus headroom, representing the theoretical upper bound.
+
+The advisory includes a note stating clearly that it is an estimate, not a tested guarantee.
+
+### Fingerprint
+
+The session specification fingerprint is a SHA-256 hash of the device selection, context composition, budget, and topology parameters. It is deterministic and included in the journal for reproducibility.
+
 ## Tests
 
 ```bash
 # All unit/acceptance tests (excludes real-binary smoke via auto-deselect)
 uv run pytest -v
 
-# Targeted file
+# Targeted files
+uv run pytest tests/test_session.py -v
+uv run pytest tests/test_topology.py -v
 uv run pytest tests/test_application.py -v
+uv run pytest tests/test_cli.py -v
 
 # Type check
 uv run mypy src tests
@@ -108,11 +186,11 @@ The test is skipped unless both environment variables are set. It is excluded fr
 
 ## Journal schema
 
-Each successful run writes a versioned JSON document (version 2):
+Each successful run writes a versioned JSON document (version 3):
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "candidate": {
     "threads": 4,
     "batch_size": 512,
@@ -150,11 +228,38 @@ Each successful run writes a versioned JSON document (version 2):
     "symlink_warning": false,
     "network_mount_detected": false,
     "diagnostics": []
+  },
+  "session_spec": {
+    "cpu_only": false,
+    "selected_device_ids": [],
+    "n_ctx": {"total": 2048, "prompt": 512, "generation": 1024, "depth": 512},
+    "fingerprint": "abc123...",
+    "topology": {
+      "cpu_count": 8,
+      "system_memory_bytes": 17179869184,
+      "accelerators": [],
+      "memory_unified": false
+    },
+    "budget": {
+      "ram_bytes": 17179869184,
+      "vram_bytes": null,
+      "headroom_ratio": 0.1
+    },
+    "advisory": {
+      "likely_fit_lower": 10000,
+      "likely_fit_upper": 20000,
+      "uncertain_maximum": 22000,
+      "model_weight_bytes": 4500000000,
+      "kv_cache_bytes_estimate": 500000000,
+      "note": "This is an estimate..."
+    }
   }
 }
 ```
 
 `shards` contains one fingerprint entry per shard file path (with `size_bytes`, `modified_time`, `digest_sha256`) when the model is a split shard set; an empty array for a single file.
+
+`session_spec` is present when the run used session setup (default). It contains the full session specification, including the system topology, resource budget, context advisory, and fingerprint for provenance.
 
 ## Error handling
 
@@ -172,5 +277,8 @@ Each successful run writes a versioned JSON document (version 2):
 | Missing required `backends:` or `supported_output_formats:` in version output | `ToolchainError` |
 | llama-bench exits nonzero | `SubprocessError` including captured stderr |
 | Unparseable / malformed output | `MalformedOutputError` including raw output |
+| GPU offload requested in CPU-only mode | `InconsistentNglError` (preflight, no process launch) |
+| Multiple accelerators detected but no device selected | `NoAcceleratorSelectedError` (preflight, no process launch) |
+| Device ID not found among detected accelerators | `UnknownDeviceError` (preflight, no process launch) |
 
 Errors are printed to stderr; exit code is 1; no traceback.

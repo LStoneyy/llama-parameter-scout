@@ -47,6 +47,97 @@ class ModelRejectedError(ScoutError):
     """The model path or format is not acceptable."""
 
 
+class SessionSetupError(ScoutError):
+    """Base for session-specification errors."""
+
+
+class NoAcceleratorSelectedError(SessionSetupError):
+    """Acceleration was chosen but no accelerator device was selected."""
+
+
+class MultipleAcceleratorsSelectedError(SessionSetupError):
+    """More than one accelerator device ID was provided."""
+
+
+class UnknownDeviceError(SessionSetupError):
+    """The selected device ID does not match any detected accelerator."""
+
+
+class InconsistentNglError(SessionSetupError):
+    """n_gpu_layers is inconsistent with CPU-only / device selection."""
+
+
+class ModelFingerprintMismatchError(SessionSetupError):
+    """Session spec model fingerprint does not match inspected model."""
+
+
+# ── Session domain models ────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class Accelerator:
+    kind: str
+    backend: str
+    device_id: int
+    description: str
+    memory_bytes: int | None = None
+
+
+@dataclass(frozen=True)
+class SystemTopology:
+    cpu_count: int
+    system_memory_bytes: int
+    accelerators: tuple[Accelerator, ...]
+    memory_unified: bool
+
+
+@dataclass(frozen=True)
+class ResourceBudget:
+    ram_bytes: int
+    vram_bytes: int | None
+    headroom_ratio: float
+
+
+class ContextExceededWithoutAcknowledgementError(SessionSetupError):
+    """n_ctx exceeds model training context and was not acknowledged."""
+
+
+class NonpositiveBudgetError(SessionSetupError):
+    """Resource budget values must be positive."""
+
+
+class InvalidHeadroomRatioError(SessionSetupError):
+    """Headroom ratio must be in [0.0, 1.0)."""
+
+
+TrainingContextStatus = Literal["known", "unknown", "conflicted"]
+
+
+@dataclass(frozen=True)
+class ContextAdvisory:
+    likely_fit_lower: int
+    likely_fit_upper: int
+    uncertain_maximum: int
+    model_weight_bytes: int
+    kv_cache_bytes_estimate: int
+    training_context_status: TrainingContextStatus = "unknown"
+    training_context_tokens: int | None = None
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class SessionSpecification:
+    topology: SystemTopology
+    cpu_only: bool
+    selected_device_ids: tuple[int, ...]
+    n_ctx: NctxComposition
+    budget: ResourceBudget
+    advisory: ContextAdvisory
+    model: ModelFingerprint
+    acknowledged: bool
+    fingerprint: str
+
+
 # ── Domain models ────────────────────────────────────────────────
 
 BinarySource = Literal["explicit", "install_dir", "path"]
@@ -132,3 +223,4 @@ class BenchmarkObservation:
     model_path: Path
     toolchain: ToolchainFingerprint
     model: ModelFingerprint
+    session_spec: SessionSpecification | None = None
