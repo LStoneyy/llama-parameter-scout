@@ -294,6 +294,19 @@ async def test_wizard_validation_mtp_requires_paths() -> None:
         assert "llama-server path is required" in text
 
 
+async def test_wizard_quit_button_exits(monkeypatch: Any) -> None:
+    app = ScoutTuiApp()
+    async with app.run_test(size=(80, 80)) as pilot:
+        await pilot.pause()
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        exit_calls: list[Any] = []
+        monkeypatch.setattr(app, "exit", lambda *a, **kw: exit_calls.append((a, kw)))
+        await pilot.click("#quit_btn")
+        await pilot.pause()
+        assert len(exit_calls) == 1
+
+
 async def test_wizard_validation_device_id_integer() -> None:
     app = ScoutTuiApp()
     async with app.run_test() as pilot:
@@ -347,6 +360,23 @@ async def test_review_never_calls_start_or_resume(tmp_path: Path) -> None:
             await pilot.pause()
         assert len(fa.calls.get("start_or_resume_session", [])) == 0
         assert len(fa.calls.get("setup_session", [])) > 0
+
+
+async def test_review_quit_button_exits(tmp_path: Path, monkeypatch: Any) -> None:
+    fa = FakeApp()
+    app = ScoutTuiApp(app_factory=lambda r: fa, **_tui_kw())
+    async with app.run_test(size=(80, 40)) as pilot:
+        await pilot.pause()
+        _setup_wizard(app, tmp_path)
+        await pilot.press("f10")
+        await pilot.pause()
+        rs = app.screen
+        assert isinstance(rs, ReviewScreen)
+        exit_calls: list[Any] = []
+        monkeypatch.setattr(app, "exit", lambda *a, **kw: exit_calls.append((a, kw)))
+        await pilot.click("#quit_btn")
+        await pilot.pause()
+        assert len(exit_calls) == 1
 
 
 # ── End-to-end flow via Pilot ────────────────────────────────────
@@ -478,6 +508,37 @@ async def test_cancellation_during_screening(tmp_path: Path) -> None:
         assert isinstance(app.screen, ResultsScreen)
         md_text = _text(app.screen.query_one("#md-content"))
         assert "Cancelled" in md_text
+
+
+async def test_progress_quit_button_exits(monkeypatch: Any) -> None:
+    app = ScoutTuiApp()
+    async with app.run_test() as pilot:
+        monkeypatch.setattr(ProgressScreen, "run_benchmark", lambda self: None)
+        ps = ProgressScreen()
+        app.push_screen(ps)
+        await pilot.pause()
+        assert not ps._cancellation_event.is_set()
+        exit_calls: list[Any] = []
+        monkeypatch.setattr(app, "exit", lambda *a, **kw: exit_calls.append((a, kw)))
+        await pilot.click("#quit_btn")
+        await pilot.pause()
+        assert ps._cancellation_event.is_set()
+        assert len(exit_calls) == 1
+
+async def test_progress_ctrlq_triggers_quit(monkeypatch: Any) -> None:
+    app = ScoutTuiApp()
+    async with app.run_test() as pilot:
+        monkeypatch.setattr(ProgressScreen, "run_benchmark", lambda self: None)
+        ps = ProgressScreen()
+        app.push_screen(ps)
+        await pilot.pause()
+        assert not ps._cancellation_event.is_set()
+        exit_calls: list[Any] = []
+        monkeypatch.setattr(app, "exit", lambda *a, **kw: exit_calls.append((a, kw)))
+        await pilot.press("ctrl+q")
+        await pilot.pause()
+        assert ps._cancellation_event.is_set()
+        assert len(exit_calls) == 1
 
 
 # ── Progress screen (unit) ──────────────────────────────────────
