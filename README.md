@@ -2,7 +2,7 @@
 
 Benchmark llama.cpp models across candidate configurations by driving `llama-bench` with explicit settings, collecting throughput samples, and journaling results.
 
-> **Status:** issue 06 - GPU layers, Flash Attention, K/V cache type pairing, and MoE expert CPU placement screening.
+> **Status:** issue 07 - full-context validation of screened finalists.
 > No resource-budget recommendations, resume, or TUI yet.
 
 ## Setup
@@ -282,6 +282,52 @@ report = screen(
 ```
 
 See `tests/test_search.py` for comprehensive deterministic fake-evaluator tests covering pruning, ranking, tie-breaking, budget enforcement, adaptive repetitions, and zero-survivor handling.
+
+## Validation (issue 07)
+
+The validation module pulls candidates from the ranked screening shortlist and evaluates them at the exact total n_ctx requested by the user, not at the short screening context (512).
+
+### Validation process
+
+1. **Accept a ScreeningReport** — the public `Application.validate_candidates()` method takes an existing report and does not repeat screening.
+2. **Iterate survivors** — candidates are pulled from `ScreeningReport.survivors` in rank order.
+3. **Full-context evaluation** — each candidate is evaluated at the exact requested `NctxComposition` (prompt + generation + depth = total).
+4. **Context verification** — the effective observation context fields (prompt, generation, depth, total) are verified to match the requested composition exactly. A mismatch (any component differs or the sum does not equal total) is recorded as `context_mismatch` and the candidate is not validated.
+5. **Bounded attempts** — at most 3 successful validations are collected. The process stops early when the shortlist is exhausted or a configurable finite attempt budget is reached.
+6. **Re-ranking** — after each successful validation, all successful candidates are re-ranked by the selected objective (pp, tg, or balanced). The updated ranking is used to determine the recommendation order.
+7. **Discriminated result**:
+   - **`ValidatedRecommendation`** — emitted when at least one candidate completes validation. Contains the top-ranked `recommendation`, `alternatives`, and `failures`.
+   - **`NoWinnerReport`** — emitted when zero candidates validate. Contains the `ProvisionalLeader` from screening and the failure reasons.
+
+### No-winner state
+
+When all candidates fail validation, the result is a `NoWinnerReport` that carries:
+- The `ProvisionalLeader` from screening (labeled "Screening evidence only — not validated at requested context").
+- Every validation attempt failure with its disposition category (OOM, timeout, crash, malformed_output, context_mismatch, validation_budget_exhausted, systemic_error) and a human-readable reason.
+
+### Language rules
+
+- Validated candidates carry the label: `"Full-context validation - verified at requested context"`.
+- Unvalidated screening evidence (the `ProvisionalLeader`) is never described as the best at the requested context. Its label always reads: `"Screening evidence only - not validated at requested context"`.
+- The two labels are mutually exclusive: a validated recommendation replaces the provisional leader; they never merge.
+
+### Injection seam
+
+```python
+from llama_parameter_scout.search import ValidationEvaluator, validate_shortlist
+
+class MyValidator:
+    def __call__(self, candidate, n_ctx) -> ScreeningResult:
+        ...
+
+result = validate_shortlist(
+    screening_report=report,
+    requested_n_ctx=requested_ctx,
+    evaluator=MyValidator(),
+)
+```
+
+See `tests/test_issue07.py` for comprehensive validation tests covering OOM finalists, rank reversal, budget exhaustion, all-fail/no-winner, context mismatch, exactly three successes, and objective-specific ranking (pp, tg, balanced).
 
 ## Tests
 
