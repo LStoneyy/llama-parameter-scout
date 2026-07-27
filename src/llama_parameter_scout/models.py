@@ -348,6 +348,10 @@ class ScreeningObservation:
     pp_samples: tuple[float, ...]
     tg_samples: tuple[float, ...]
     memory_bytes: int | None = None
+    observed_prompt: int | None = None
+    observed_generation: int | None = None
+    observed_depth: int | None = None
+    observed_total: int | None = None
 
 
 @dataclass(frozen=True)
@@ -399,3 +403,54 @@ class ScreeningReport:
     objective: str = "balanced"
     disposition_summary: str = ""
     notes: tuple[str, ...] = ()
+
+
+# ── Validation domain models ──────────────────────────────────────
+
+
+ValidationDisposition = Literal[
+    "oom",
+    "timeout",
+    "crash",
+    "malformed_output",
+    "context_mismatch",
+    "validation_budget_exhausted",
+    "systemic_error",
+]
+
+
+@dataclass(frozen=True)
+class ValidatedCandidate:
+    candidate: CandidateConfig
+    pp_score: float
+    tg_score: float
+    balanced: float
+    pp_median: float
+    tg_median: float
+    pp_relative_dispersion: float
+    tg_relative_dispersion: float
+    label: str = "Full-context validation - verified at requested context"
+
+
+@dataclass(frozen=True)
+class FailedValidation:
+    candidate: CandidateConfig
+    disposition: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class ValidatedRecommendation:
+    recommendation: ValidatedCandidate
+    alternatives: tuple[ValidatedCandidate, ...]
+    failures: tuple[FailedValidation, ...]
+    attempts_used: int
+    budget: int
+
+
+@dataclass(frozen=True)
+class NoWinnerReport:
+    provisional_leader: ProvisionalLeader | None
+    failures: tuple[FailedValidation, ...]
+    attempts_used: int
+    budget: int

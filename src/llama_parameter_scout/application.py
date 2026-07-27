@@ -22,6 +22,7 @@ from .models import (
     ContextAdvisory,
     ContextExceededWithoutAcknowledgementError,
     ExecutionPolicy,
+    FailedValidation,
     InconsistentNglError,
     InvalidHeadroomRatioError,
     InvalidNctxError,
@@ -34,6 +35,7 @@ from .models import (
     NctxComposition,
     NoAcceleratorSelectedError,
     NonpositiveBudgetError,
+    NoWinnerReport,
     ResourceBudget,
     ScoutError,
     ScreeningDisposition,
@@ -49,6 +51,7 @@ from .models import (
     ToolchainFingerprint,
     TrainingContextStatus,
     UnknownDeviceError,
+    ValidatedRecommendation,
 )
 from .runner import (
     ProcessAdapter,
@@ -57,8 +60,14 @@ from .runner import (
     ProcessStartError,
     ProductionProcessAdapter,
 )
-from .search import SCREENING_N_CTX, ScreeningEvaluator, generate_screening_grid
+from .search import (
+    SCREENING_N_CTX,
+    ScreeningEvaluator,
+    ValidationEvaluator,
+    generate_screening_grid,
+)
 from .search import screen as _search_screen
+from .search import validate_shortlist as _validate_shortlist
 from .toolchain import inspect_toolchain
 from .topology import DetectTopologyFn, detect_topology
 
@@ -1107,6 +1116,10 @@ def _run_screening_workload(
             candidate=candidate,
             pp_samples=tuple(obs.samples_tps),
             tg_samples=tuple(obs.samples_tps),
+            observed_prompt=obs.prompt_ctx,
+            observed_generation=obs.generation_ctx,
+            observed_depth=obs.depth_ctx,
+            observed_total=obs.total_ctx,
         ),
     )
 
@@ -1567,6 +1580,77 @@ class Application:
             )
 
         return report
+
+    def validate_candidates(
+        self,
+        request: SingleRunRequest,
+        screening_report: ScreeningReport,
+        *,
+        budget: int = 10,
+        objective: str = "balanced",
+        validation_evaluator: ValidationEvaluator | None = None,
+        session_spec: SessionSpecification | None = None,
+        policy: ExecutionPolicy | None = None,
+    ) -> ValidatedRecommendation | NoWinnerReport:
+        _validate_request(request)
+
+        if validation_evaluator is not None:
+            return _validate_shortlist(
+                screening_report=screening_report,
+                requested_n_ctx=request.n_ctx,
+                objective=objective,
+                budget=budget,
+                evaluator=validation_evaluator,
+            )
+
+        try:
+            toolchain = inspect_toolchain(self._runner, request.binary_path)
+        except ScoutError as e:
+            return NoWinnerReport(
+                provisional_leader=screening_report.leader,
+                failures=(
+                    FailedValidation(
+                        candidate=request.candidate,
+                        disposition="systemic_error",
+                        reason=f"Toolchain inspection failed: {e}",
+                    ),
+                ),
+                attempts_used=0,
+                budget=budget,
+            )
+
+        try:
+            model = inspect_model(request.model_path)
+        except ScoutError as e:
+            return NoWinnerReport(
+                provisional_leader=screening_report.leader,
+                failures=(
+                    FailedValidation(
+                        candidate=request.candidate,
+                        disposition="systemic_error",
+                        reason=f"Model inspection failed: {e}",
+                    ),
+                ),
+                attempts_used=0,
+                budget=budget,
+            )
+
+        def _production_validator(
+            candidate: CandidateConfig,
+            n_ctx: NctxComposition,
+        ) -> ScreeningResult:
+            return _run_screening_workload(
+                self, request, candidate, n_ctx, 3,
+                toolchain, model, session_spec, policy,
+            )
+
+        return _validate_shortlist(
+            screening_report=screening_report,
+            requested_n_ctx=request.n_ctx,
+            objective=objective,
+            budget=budget,
+            evaluator=_production_validator,
+        )
 
     def run(
         self,

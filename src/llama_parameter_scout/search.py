@@ -8,8 +8,10 @@ from typing import Protocol
 
 from .models import (
     CandidateConfig,
+    FailedValidation,
     ModelFingerprint,
     NctxComposition,
+    NoWinnerReport,
     ProvisionalLeader,
     RankedCandidate,
     ScreeningObservation,
@@ -17,6 +19,8 @@ from .models import (
     ScreeningResult,
     SearchProfile,
     ToolchainFingerprint,
+    ValidatedCandidate,
+    ValidatedRecommendation,
 )
 
 _SortKeyFn = Callable[[RankedCandidate], tuple[float, ...]]
@@ -68,6 +72,14 @@ class ScreeningEvaluator(Protocol):
         candidate: CandidateConfig,
         n_ctx: NctxComposition,
         repetitions: int,
+    ) -> ScreeningResult: ...
+
+
+class ValidationEvaluator(Protocol):
+    def __call__(
+        self,
+        candidate: CandidateConfig,
+        n_ctx: NctxComposition,
     ) -> ScreeningResult: ...
 
 
@@ -479,6 +491,18 @@ def _sort_key(objective: str) -> _SortKeyFn:
     return key
 
 
+def _validation_sort_key(objective: str) -> Callable[[ValidatedCandidate], tuple[float, ...]]:
+    def key(vc: ValidatedCandidate) -> tuple[float, ...]:
+        stability = vc.pp_relative_dispersion + vc.tg_relative_dispersion
+        if objective == "pp":
+            return (-vc.pp_score, stability)
+        elif objective == "tg":
+            return (-vc.tg_score, stability)
+        else:
+            return (-vc.balanced, stability)
+    return key
+
+
 # ── Main screen function ─────────────────────────────────────────
 
 
@@ -744,3 +768,136 @@ def screen(
         objective=objective,
         disposition_summary=summary,
     )
+
+
+# ── Validation ───────────────────────────────────────────────────
+
+
+def _baseline_medians(
+    report: ScreeningReport,
+) -> tuple[float, float]:
+    obs = report.baseline_disposition.observation
+    if obs is None or not obs.pp_samples:
+        return 0.0, 0.0
+    return _median(obs.pp_samples), _median(obs.tg_samples)
+
+
+def validate_shortlist(
+    *,
+    screening_report: ScreeningReport,
+    requested_n_ctx: NctxComposition,
+    objective: str = "balanced",
+    budget: int = 10,
+    evaluator: ValidationEvaluator,
+) -> ValidatedRecommendation | NoWinnerReport:
+    if objective not in ("pp", "tg", "balanced"):
+        raise ValueError(
+            f"Objective must be 'pp', 'tg', or 'balanced', got {objective!r}",
+        )
+
+    base_pp, base_tg = _baseline_medians(screening_report)
+
+    successes: list[ValidatedCandidate] = []
+    failures: list[FailedValidation] = []
+    attempts = 0
+
+    for survivor in screening_report.survivors:
+        if attempts >= budget:
+            failures.append(FailedValidation(
+                candidate=survivor.candidate,
+                disposition="validation_budget_exhausted",
+                reason=f"Validation budget of {budget} attempts exhausted",
+            ))
+            break
+
+        if len(successes) >= 3:
+            break
+
+        attempts += 1
+        result = evaluator(survivor.candidate, requested_n_ctx)
+
+        if not result.success:
+            failures.append(FailedValidation(
+                candidate=survivor.candidate,
+                disposition=result.disposition,
+                reason=result.reason or f"Validation failed: {result.disposition}",
+            ))
+            continue
+
+        obs = result.observation
+        if obs is None:
+            failures.append(FailedValidation(
+                candidate=survivor.candidate,
+                disposition="systemic_error",
+                reason="Evaluator returned success with no observation",
+            ))
+            continue
+
+        mismatch_reason = _context_mismatch(obs, requested_n_ctx)
+        if mismatch_reason is not None:
+            failures.append(FailedValidation(
+                candidate=survivor.candidate,
+                disposition="context_mismatch",
+                reason=mismatch_reason,
+            ))
+            continue
+
+        ranked = _build_result(survivor.candidate, [obs], base_pp, base_tg)
+        successes.append(ValidatedCandidate(
+            candidate=ranked.candidate,
+            pp_score=ranked.pp_score,
+            tg_score=ranked.tg_score,
+            balanced=ranked.balanced,
+            pp_median=ranked.pp_median,
+            tg_median=ranked.tg_median,
+            pp_relative_dispersion=ranked.pp_relative_dispersion,
+            tg_relative_dispersion=ranked.tg_relative_dispersion,
+        ))
+        successes.sort(key=_validation_sort_key(objective))
+
+    if successes:
+        return ValidatedRecommendation(
+            recommendation=successes[0],
+            alternatives=tuple(successes[1:]),
+            failures=tuple(failures),
+            attempts_used=attempts,
+            budget=budget,
+        )
+
+    return NoWinnerReport(
+        provisional_leader=screening_report.leader,
+        failures=tuple(failures),
+        attempts_used=attempts,
+        budget=budget,
+    )
+
+
+def _context_mismatch(
+    obs: ScreeningObservation,
+    requested: NctxComposition,
+) -> str | None:
+    mismatches: list[str] = []
+
+    fields = [
+        ("total", obs.observed_total, requested.total),
+        ("prompt", obs.observed_prompt, requested.prompt),
+        ("generation", obs.observed_generation, requested.generation),
+        ("depth", obs.observed_depth, requested.depth),
+    ]
+    for name, observed, expected in fields:
+        if observed is None:
+            mismatches.append(f"{name}=missing")
+        elif observed != expected:
+            mismatches.append(f"{name}={observed} (expected {expected})")
+
+    if obs.observed_prompt is not None and obs.observed_generation is not None \
+            and obs.observed_depth is not None and obs.observed_total is not None:
+        comp_sum = obs.observed_prompt + obs.observed_generation + obs.observed_depth
+        if comp_sum != obs.observed_total:
+            mismatches.append(
+                f"prompt+generation+depth={comp_sum} != total={obs.observed_total}"
+            )
+
+    if mismatches:
+        return "Effective context does not match requested: " + "; ".join(mismatches)
+    return None
