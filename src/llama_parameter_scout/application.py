@@ -40,6 +40,7 @@ from .models import (
     InvalidHeadroomRatioError,
     InvalidNctxError,
     JournalError,
+    LaunchProvenance,
     MalformedOutputError,
     MemoryEvidence,
     ModelFingerprint,
@@ -2018,6 +2019,54 @@ class Application:
             raise JournalError(f"Failed to write journal: {e}") from e
 
         return observation
+
+    # ── Export seam ───────────────────────────────────────────────
+
+    def export_report_json(
+        self,
+        *,
+        session: SessionSpecification,
+        toolchain: ToolchainFingerprint,
+        model: ModelFingerprint,
+        screening_report: ScreeningReport | None = None,
+        validation_result: ValidatedRecommendation | NoWinnerReport | None = None,
+        provenance: LaunchProvenance | None = None,
+        include_hashes: bool = False,
+    ) -> str:
+        from .reporter import render_export_json as _render
+
+        return _render(
+            session=session,
+            toolchain=toolchain,
+            model=model,
+            screening_report=screening_report,
+            validation_result=validation_result,
+            provenance=provenance,
+            include_hashes=include_hashes,
+        )
+
+    def export_report_markdown(
+        self,
+        *,
+        session: SessionSpecification,
+        toolchain: ToolchainFingerprint,
+        model: ModelFingerprint,
+        screening_report: ScreeningReport | None = None,
+        validation_result: ValidatedRecommendation | NoWinnerReport | None = None,
+        provenance: LaunchProvenance | None = None,
+        include_hashes: bool = False,
+    ) -> str:
+        from .reporter import render_export_markdown as _render
+
+        return _render(
+            session=session,
+            toolchain=toolchain,
+            model=model,
+            screening_report=screening_report,
+            validation_result=validation_result,
+            provenance=provenance,
+            include_hashes=include_hashes,
+        )
 
 
 # ── Resource budget gate ─────────────────────────────────────────

@@ -2,8 +2,9 @@
 
 Benchmark llama.cpp models across candidate configurations by driving `llama-bench` with explicit settings, collecting throughput samples, and journaling results.
 
-> **Status:** issue 09 — resume or derive benchmark sessions with
-> fingerprint-based exact-match reuse and CLI session listing.
+> **Status:** issue 10 — export reproducible and share-safe artifacts
+> with versioned private JSON, redacted Markdown reports, shell quoting
+> across POSIX/PowerShell/cmd, reproduction argv, and preset.ini generation.
 > No TUI or MTP yet.
 
 ## Setup
@@ -424,6 +425,101 @@ uv run pytest tests/test_issue08.py -v
 
 See `tests/test_issue08.py` for acceptance tests covering: fastest stable fit, no-fit, no-complete-metrics, discrete RAM/VRAM enforcement, unified enforcement, Pareto frontier (dominated exclusion, incomplete exclusion), evidence quality labels, validation no-winner semantics, and Application seam budget/topology propagation.
 
+## Export (issue 10)
+
+From a completed benchmark session, export two artifact types. Access through the `Application` seam or the standalone `reporter` module.
+
+```python
+from llama_parameter_scout.application import Application
+from llama_parameter_scout.models import LaunchProvenance
+
+app = Application(runner)
+
+# Private full JSON
+json_str = app.export_report_json(
+    session=session,
+    toolchain=toolchain,
+    model=model,
+    screening_report=report,
+    validation_result=validation,
+    provenance=LaunchProvenance(
+        cwd="/home/user/project",
+        shell_dialect="posix",
+        executable_path="/usr/local/bin/llama-bench",
+        argv=("llama-bench", "-m", "model.gguf"),
+        environment={"CUDA_VISIBLE_DEVICES": "0"},
+    ),
+    include_hashes=True,   # optional: add content hashes
+)
+
+# Share-safe Markdown (paths and device IDs redacted)
+md_str = app.export_report_markdown(
+    session=session,
+    toolchain=toolchain,
+    model=model,
+    screening_report=report,
+    validation_result=validation,
+    provenance=provenance,
+)
+```
+
+### JSON artifact
+
+The private JSON (`artifact_type: "private_reproducibility_artifact"`) contains:
+
+- **Schema** — versioned as `scout-export-v1`
+- **Provenance** — structured `cwd`, `shell_dialect`, `executable_path`, `argv`, `environment`
+- **Session** — full `SessionSpecification` with topology, budget, advisory, model, fingerprint
+- **Toolchain** — binary path, version, supported flags, cache types, device capabilities
+- **Model** — architecture, parameters, quantization, shard fingerprints
+- **Screening** — profile, objective, baseline, grid/adaptive dispositions, survivors, leader, Pareto frontier
+- **Validation** — `validated_recommendation` or `no_winner` with candidates/alternatives/failures
+- **Reproduction commands** — llama-bench reproduction argv for every survivor; compatible llama-cli and llama-server invocations; valid `preset.ini` section for the recommended configuration
+- **Benchmark-only flags** — `-o` (output format) and `-r` (repetition count) are noted as benchmark-only; no claim of 1:1 mapping to production is made
+- **Optional hashes** — content hashes for integrity verification, with a caveat that performance reproducibility is never guaranteed
+
+The JSON is labelled as a **private reproducibility artifact** and should not be shared directly.
+
+### Markdown artifact
+
+The share-safe Markdown report includes all the same information with:
+
+- Home directory paths replaced with `[HOME]`
+- UUID-formatted device identifiers replaced with `[DEVICE-ID]`
+- Clear labelling as **share-safe report**
+- Shell commands quoted for **POSIX** (default) using `shlex.quote()`
+- Honest handling of **provisional** (screening evidence only) and **no-winner** states
+
+### Shell quoting
+
+The `quote_for_shell(value, dialect)` and `join_argv(argv, dialect)` helpers support three dialects:
+
+| Dialect | Method | Example |
+|---------|--------|---------|
+| `posix` | `shlex.quote()` | `'/path/with spaces/file.gguf'` |
+| `powershell` | Single quotes with `''` escaping | `'/path/with spaces/file.gguf'` |
+| `cmd` | Double quotes with `\"` escaping | `"/path/with spaces/file.gguf"` |
+
+### Preset.ini
+
+The `build_preset_ini_section()` function generates a valid `llama-server` preset.ini section:
+
+```ini
+[llama]
+n_ctx = 2048
+n_batch = 512
+n_ubatch = 512
+n_threads = 4
+n_gpu_layers = 0
+flash_attn = false
+cache_type_k = f16
+cache_type_v = f16
+```
+
+### Launch provenance
+
+The `LaunchProvenance` dataclass accepts structured provenance as input rather than claiming runtime-captured values. Only environment fields actually needed by the session (e.g. `CUDA_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`) are included — secrets are never exposed wholesale.
+
 ## Tests
 
 ```bash
@@ -437,6 +533,7 @@ uv run pytest tests/test_topology.py -v
 uv run pytest tests/test_application.py -v
 uv run pytest tests/test_cli.py -v
 uv run pytest tests/test_issue09.py -v
+uv run pytest tests/test_issue10.py -v
 
 # Type check
 uv run mypy src tests

@@ -6,6 +6,8 @@ from pathlib import Path
 from threading import Event
 from typing import Literal
 
+ShellDialect = Literal["posix", "powershell", "cmd"]
+
 # ── Error hierarchy ──────────────────────────────────────────────
 
 
@@ -499,3 +501,22 @@ class SessionResumeResult:
     observation: BenchmarkObservation | None = None
     mismatch_reason: str | None = None
     completed_search_results: tuple[ScreeningResult, ...] = ()
+
+
+# ── Export domain models ──────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class LaunchProvenance:
+    cwd: str
+    shell_dialect: ShellDialect
+    executable_path: str
+    argv: tuple[str, ...]
+    environment: dict[str, str]
+
+    def __post_init__(self) -> None:
+        if self.shell_dialect not in ("posix", "powershell", "cmd"):
+            raise ValueError(
+                f"shell_dialect must be 'posix', 'powershell', or 'cmd', "
+                f"got {self.shell_dialect!r}"
+            )
