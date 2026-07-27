@@ -48,5 +48,5 @@ def test_real_binary_smoke(tmp_path: Path) -> None:
 
     assert request.journal_path.exists()
     data = json.loads(request.journal_path.read_text())
-    assert data["version"] == 1
+    assert data["version"] == 2
     assert data["n_measurements"] >= 3

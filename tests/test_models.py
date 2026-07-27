@@ -27,3 +27,8 @@ def test_request_fields(valid_request: SingleRunRequest) -> None:
     assert valid_request.n_ctx.total == 2048
     assert valid_request.candidate.threads == 4
     assert valid_request.journal_path.name == "journal.json"
+    assert valid_request.binary_source == "explicit"
+
+
+def test_request_default_binary_source(valid_request: SingleRunRequest) -> None:
+    assert valid_request.binary_source == "explicit"
