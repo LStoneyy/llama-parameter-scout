@@ -277,7 +277,7 @@ class TestMain:
             ])
         assert exc.value.code == 1
         captured = capsys.readouterr()
-        assert "Error:" in captured.err
+        assert "Disposition: unsupported" in captured.out
 
     def test_success_output(
         self,
@@ -339,7 +339,7 @@ class TestMain:
         assert jp.exists()
         import json
         data = json.loads(jp.read_text())
-        assert data["version"] == 3
+        assert data["version"] == 4
 
     def test_success_with_install_dir(
         self,

@@ -5,12 +5,14 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from .application import Application
+from .application import Application, make_memory_pressure_fn
 from .model_inspector import inspect_model
 from .models import (
     CandidateConfig,
+    CandidateOutcome,
     ContextAdvisory,
     ContextExceededWithoutAcknowledgementError,
+    ExecutionPolicy,
     InconsistentNglError,
     ModelFingerprint,
     MultipleAcceleratorsSelectedError,
@@ -25,7 +27,6 @@ from .models import (
     UnknownDeviceError,
 )
 from .runner import ProductionRunner
-from .toolchain import resolve_binary
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -157,6 +158,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Override device VRAM budget in bytes for the context advisory",
     )
+    parser.add_argument(
+        "--candidate-timeout",
+        type=float,
+        default=None,
+        help="Maximum seconds for each candidate process launch (default: no timeout)",
+    )
     return parser.parse_args(argv)
 
 
@@ -200,6 +207,22 @@ def _print_advisory(advisory: ContextAdvisory) -> None:
     print(f"    Likely-fit range: {advisory.likely_fit_lower} - {advisory.likely_fit_upper} tokens")
     print(f"    Uncertain maximum: {advisory.uncertain_maximum} tokens")
     print(f"    Note: {advisory.note}")
+
+
+def _print_outcome(outcome: CandidateOutcome, journal_path: Path | None = None) -> None:
+    print(f"\nDisposition: {outcome.disposition}")
+    if outcome.diagnostic:
+        print(f"Diagnostic: {outcome.diagnostic[:200]}")
+    if outcome.safe_next_action:
+        print(f"Next action: {outcome.safe_next_action}")
+    if outcome.observation is not None:
+        obs = outcome.observation
+        print("\nWarmup complete.")
+        print(f"Measurements: {len(obs.samples_tps)} repetitions")
+        print(f"Median throughput: {obs.median_tps:.2f} t/s")
+        print(f"Dispersion (population stddev): {obs.dispersion_tps:.2f} t/s")
+    if journal_path is not None:
+        print(f"Journal: {journal_path}")
 
 
 def _get_context_warning(model: ModelFingerprint, n_ctx_total: int) -> str | None:
@@ -249,6 +272,7 @@ def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
 
     try:
+        from .toolchain import resolve_binary
         resolution = resolve_binary(
             llama_bench=args.binary_path,
             install_dir=args.install_dir,
@@ -335,23 +359,27 @@ def main(argv: list[str] | None = None) -> None:
         binary_source=resolution.source,
     )
 
+    memory_pressure_fn = make_memory_pressure_fn(spec) if spec is not None else None
+    policy = ExecutionPolicy(
+        candidate_timeout_seconds=args.candidate_timeout,
+        memory_pressure_fn=memory_pressure_fn,
+    )
+
     def _on_ready(tc: ToolchainFingerprint, m: ModelFingerprint) -> None:
         _print_toolchain_fingerprint(tc, request.binary_source)
         _print_model_fingerprint(m)
 
-    try:
-        observation = app.run(request, on_ready=_on_ready, session_spec=spec)
-    except ScoutError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    print(
-        f"Warmup complete.\n"
-        f"Measurements: {len(observation.samples_tps)} repetitions\n"
-        f"Median throughput: {observation.median_tps:.2f} t/s\n"
-        f"Dispersion (population stddev): {observation.dispersion_tps:.2f} t/s\n"
-        f"Journal: {request.journal_path}",
+    outcome = app.evaluate_candidate(
+        request,
+        on_ready=_on_ready,
+        session_spec=spec,
+        policy=policy,
     )
+
+    _print_outcome(outcome, journal_path=request.journal_path)
+
+    if outcome.disposition != "completed":
+        sys.exit(1)
 
 
 def _print_toolchain_fingerprint(tc: ToolchainFingerprint, source: str) -> None:

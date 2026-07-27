@@ -2,8 +2,8 @@
 
 Benchmark llama.cpp models across candidate configurations by driving `llama-bench` with explicit settings, collecting throughput samples, and journaling results.
 
-> **Status:** issue 03 - topology detection, device selection, session specification, context advisory.
-> No adaptive search, full report rendering, TUI, or timeout/resource containment yet.
+> **Status:** issue 04 - candidate execution classification, process-tree containment, outcome dispositions.
+> No adaptive search, full report rendering, or TUI yet.
 
 ## Setup
 
@@ -282,3 +282,123 @@ Each successful run writes a versioned JSON document (version 3):
 | Device ID not found among detected accelerators | `UnknownDeviceError` (preflight, no process launch) |
 
 Errors are printed to stderr; exit code is 1; no traceback.
+
+## Candidate lifecycle
+
+Every candidate configuration receives exactly one **disposition**. Pre-execution dispositions are assigned without launching a child process. Execution outcomes apply only when a process is launched.
+
+### Pre-execution dispositions
+
+| Disposition | Meaning | Next action |
+|-------------|---------|-------------|
+| `unsupported` | Binary not found, model not found, invalid configuration, unsupported device/backend | Check binary, model path, and configuration validity |
+| `pruned` | Candidate parameter inconsistent with session (e.g. n_gpu_layers > 0 in cpu-only mode) | Adjust candidate parameter bounds |
+| `not_attempted` | Candidate skipped by session logic | Ensure session is set up |
+| `budget_exhausted` | Resource budget insufficient based on model footprint + KV cache estimate vs RAM/VRAM after headroom | Increase budget or reduce workload |
+
+### Execution outcomes (process launched)
+
+| Disposition | Meaning | Next action |
+|-------------|---------|-------------|
+| `completed` | Process exited with status 0; output parsed successfully | (none) |
+| `oom` | OOM evidence: known exit codes (-9, 137) or stderr OOM keywords; also triggered by repeated memory-pressure backoff | Reduce context/model size or increase memory |
+| `timeout` | Process exceeded `--candidate-timeout` and was terminated | Increase timeout or reduce workload |
+| `crash` | Process exited nonzero without OOM evidence | Check binary compatibility, model integrity |
+| `malformed_output` | Process exited 0 but output is not parseable as JSON/JSONL | Verify llama-bench version compatibility |
+| `cancellation` | Process terminated by cancellation event | The run was cancelled by user or scheduler |
+| `systemic_error` | Process adapter raised an exception during launch or monitoring | Investigate system/driver/hardware state |
+
+### Resource budget gate
+
+Before launching the candidate process, a conservative pre-execution check compares
+the estimated resource need (model weight + KV cache estimate) against the available
+budget (RAM minus headroom, plus discrete VRAM when applicable). If the budget is
+insufficient, the candidate receives `budget_exhausted` with `process_launched=False`
+and no child process is started.
+
+For unified memory systems, the check is: model weight + KV estimate ≤ available RAM.
+For discrete GPU systems, model weight is placed in VRAM first, KV cache fills remaining
+VRAM, and any excess spills to RAM.
+
+### Memory pressure detection
+
+A stdlib cross-platform best-effort memory pressure detector monitors available system
+memory against the session budget (after headroom). On Linux it reads `/proc/meminfo`,
+on macOS it parses `vm_stat`. If detection is unavailable it returns false (no pressure).
+
+Repeated pressure during a candidate run leads to bounded backoff (`--candidate-timeout`
+respects backoff intervals) then `oom` termination. The detector is wired into the CLI
+default evaluation policy when a session spec exists, and is preserved as an injectable
+`memory_pressure_fn` on `ExecutionPolicy`.
+
+### Execution policy
+
+The `--candidate-timeout` CLI option enforces a per-process wall-clock timeout:
+
+```
+--candidate-timeout 120.0
+```
+
+Default: no timeout. Memory pressure backoff is built into the policy when a session
+specification is available.
+
+### Process containment
+
+The tool launches native child processes via `Popen` with process-group management.
+Process trees are terminated on timeout, cancellation, memory pressure, and caller
+interruption. Cross-platform strategy:
+
+- **POSIX:** `os.killpg` with `SIGTERM`; 3-second grace period; `SIGKILL` fallback.
+- **Windows:** `taskkill /F /T` directly for the entire process tree (no SIGTERM).
+
+This containment is best-effort. The tool never promises absolute host isolation
+— child processes may still trigger host OOM or driver reset.
+
+### Journal schema (version 4)
+
+Every journal entry includes:
+
+- `"version": 4`
+- `"disposition"` — the candidate disposition string
+- `"process_launched"` — whether a child process was started
+- `"diagnostic"` — human-readable diagnostic details
+- `"safe_next_action"` — suggested next step
+
+Successful (`completed`) outcomes also include measurement data (`samples_tps`,
+`median_tps`, `dispersion_tps`), toolchain fingerprint, and model fingerprint.
+
+### Repeated / systemic stop policy
+
+The `StopTracker` class tracks consecutive systemic failures (crash, OOM,
+systemic_error). After `max_stops` consecutive failures it signals stop. A
+successful completion resets the counter.
+
+```python
+from llama_parameter_scout.models import StopTracker
+tracker = StopTracker(max_stops=3)
+```
+
+## CLI output
+
+Every candidate evaluation prints the disposition, diagnostic, and next action:
+
+```
+Disposition: completed
+
+Warmup complete.
+Measurements: 3 repetitions
+Median throughput: 45.30 t/s
+Dispersion (population stddev): 0.29 t/s
+Journal: /path/to/journal.json
+```
+
+For failures:
+
+```
+Disposition: crash
+Diagnostic: Process exited with code 1.
+Segmentation fault
+Next action: Check binary compatibility, model integrity, and system resources.
+```
+
+Exit code is 1 for any disposition other than `completed`.
