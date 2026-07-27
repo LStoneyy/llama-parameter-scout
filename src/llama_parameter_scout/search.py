@@ -12,8 +12,10 @@ from .models import (
     ModelFingerprint,
     NctxComposition,
     NoWinnerReport,
+    ParetoEntry,
     ProvisionalLeader,
     RankedCandidate,
+    ResourceBudget,
     ScreeningObservation,
     ScreeningReport,
     ScreeningResult,
@@ -411,10 +413,15 @@ def _compute_tie_bound(
     return avg_rd * profile.tie_bound_coefficient
 
 
-def _memory_key(candidate: RankedCandidate) -> tuple[int, ...]:
-    if candidate.memory_bytes is None:
-        return (1,)
-    return (0, candidate.memory_bytes)
+def _memory_key(candidate: RankedCandidate) -> tuple[int | float, ...]:
+    me = candidate.memory_evidence
+    if me is not None and me.ram_bytes is not None:
+        if me.vram_bytes is not None:
+            return (0, me.ram_bytes, me.vram_bytes)
+        return (0, me.ram_bytes)
+    if candidate.memory_bytes is not None:
+        return (0, candidate.memory_bytes)
+    return (1,)
 
 
 def _simplicity_key(candidate: RankedCandidate) -> tuple[int, int, int]:
@@ -486,6 +493,8 @@ def _sort_key(objective: str) -> _SortKeyFn:
             return (-c.pp_score, _stability_key(c))
         elif objective == "tg":
             return (-c.tg_score, _stability_key(c))
+        elif objective == "memory":
+            return (-c.balanced, _stability_key(c))
         else:
             return (-c.balanced, _stability_key(c))
     return key
@@ -498,6 +507,8 @@ def _validation_sort_key(objective: str) -> Callable[[ValidatedCandidate], tuple
             return (-vc.pp_score, stability)
         elif objective == "tg":
             return (-vc.tg_score, stability)
+        elif objective == "memory":
+            return (-vc.balanced, stability)
         else:
             return (-vc.balanced, stability)
     return key
@@ -523,6 +534,7 @@ def _build_result(
 
     total_reps = sum(len(o.pp_samples) for o in observations)
     memory = observations[-1].memory_bytes if observations else None
+    mem_evidence = observations[-1].memory if observations else None
 
     return RankedCandidate(
         candidate=candidate,
@@ -534,6 +546,7 @@ def _build_result(
         pp_relative_dispersion=pp_rd,
         tg_relative_dispersion=tg_rd,
         memory_bytes=memory,
+        memory_evidence=mem_evidence,
         total_repetitions=total_reps,
     )
 
@@ -587,6 +600,113 @@ def _build_disposition_summary(
     return "; ".join(parts)
 
 
+def _memory_leader(
+    ranked: list[RankedCandidate],
+    resource_budget: ResourceBudget | None,
+    memory_unified: bool,
+    dispersion_threshold: float = 1.0,
+) -> int | None:
+    """Return the index of the fastest stable candidate with complete
+    comparable memory evidence fitting within the budget, or None.
+
+    Stable means both PP and TG relative dispersion <= dispersion_threshold.
+    """
+    if resource_budget is None:
+        return None
+
+    headroom = resource_budget.headroom_ratio
+
+    eligible: list[int] = []
+    for i, rc in enumerate(ranked):
+        # Stability check
+        if (rc.pp_relative_dispersion > dispersion_threshold
+                or rc.tg_relative_dispersion > dispersion_threshold):
+            continue
+        me = rc.memory_evidence
+        if me is None or me.quality != "complete":
+            continue
+        if me.ram_bytes is None:
+            continue
+        if memory_unified or resource_budget.vram_bytes is None:
+            cap = int(resource_budget.ram_bytes * (1 - headroom))
+            if me.ram_bytes <= cap:
+                eligible.append(i)
+        else:
+            ram_cap = int(resource_budget.ram_bytes * (1 - headroom))
+            vram_cap = int(resource_budget.vram_bytes * (1 - headroom))
+            if me.ram_bytes is not None and me.vram_bytes is not None:
+                if me.ram_bytes <= ram_cap and me.vram_bytes <= vram_cap:
+                    eligible.append(i)
+
+    if not eligible:
+        return None
+    # Among eligible, pick fastest (highest balanced)
+    best_idx = eligible[0]
+    for idx in eligible[1:]:
+        if ranked[idx].balanced > ranked[best_idx].balanced:
+            best_idx = idx
+    return best_idx
+
+
+def _compute_pareto_frontier(
+    scored: list[RankedCandidate],
+    memory_unified: bool,
+) -> list[ParetoEntry]:
+    """Compute speed-vs-memory Pareto frontier.
+    Includes all candidates with complete comparable metrics.
+    A candidate is dominated when another has >= balanced speed and
+    <= every constrained memory resource, with at least one strict improvement."""
+    entries: list[ParetoEntry] = []
+    for rc in scored:
+        me = rc.memory_evidence
+        if me is None or me.quality != "complete":
+            continue
+        entries.append(ParetoEntry(
+            candidate=rc.candidate,
+            balanced=rc.balanced,
+            memory=me,
+        ))
+
+    frontier: list[ParetoEntry] = []
+    for i, a in enumerate(entries):
+        dominated = False
+        for j, b in enumerate(entries):
+            if i == j:
+                continue
+            speed_ge = b.balanced >= a.balanced
+            if memory_unified or (a.memory.vram_bytes is None and b.memory.vram_bytes is None):
+                mem_le = (
+                    (b.memory.ram_bytes is not None and a.memory.ram_bytes is not None)
+                    and b.memory.ram_bytes <= a.memory.ram_bytes
+                )
+            else:
+                mem_le = (
+                    b.memory.ram_bytes is not None and a.memory.ram_bytes is not None
+                    and b.memory.vram_bytes is not None and a.memory.vram_bytes is not None
+                    and b.memory.ram_bytes <= a.memory.ram_bytes
+                    and b.memory.vram_bytes <= a.memory.vram_bytes
+                )
+            if speed_ge and mem_le:
+                strict = (b.balanced > a.balanced)
+                if not strict and memory_unified:
+                    strict = (b.memory.ram_bytes is not None and a.memory.ram_bytes is not None
+                              and b.memory.ram_bytes < a.memory.ram_bytes)
+                elif not strict:
+                    strict = (
+                        (b.memory.ram_bytes is not None and a.memory.ram_bytes is not None
+                         and b.memory.ram_bytes < a.memory.ram_bytes)
+                        or (b.memory.vram_bytes is not None and a.memory.vram_bytes is not None
+                            and b.memory.vram_bytes < a.memory.vram_bytes)
+                    )
+                if strict:
+                    dominated = True
+                    break
+        if not dominated:
+            frontier.append(a)
+
+    return frontier
+
+
 def screen(
     *,
     base_candidate: CandidateConfig,
@@ -595,9 +715,29 @@ def screen(
     screening_n_ctx: NctxComposition,
     objective: str = "balanced",
     grid: tuple[CandidateConfig, ...] | None = None,
+    resource_budget: ResourceBudget | None = None,
+    memory_unified: bool = False,
 ) -> ScreeningReport:
-    if objective not in ("pp", "tg", "balanced"):
-        raise ValueError(f"Objective must be 'pp', 'tg', or 'balanced', got {objective!r}")
+    if objective not in ("pp", "tg", "balanced", "memory"):
+        raise ValueError(
+            f"Objective must be 'pp', 'tg', 'balanced', or 'memory', "
+            f"got {objective!r}",
+        )
+
+    if objective == "memory" and resource_budget is None:
+        return ScreeningReport(
+            profile=profile,
+            baseline_disposition=ScreeningResult(
+                candidate=base_candidate, success=False,
+                disposition="not_attempted",
+                reason="Memory objective requires a ResourceBudget but none was provided",
+            ),
+            grid_dispositions=(), survivors=(), leader=None,
+            attempts_used=0, objective=objective,
+            disposition_summary=(
+                "Memory objective requires a ResourceBudget but none was provided"
+            ),
+        )
 
     remaining = profile.max_attempts
 
@@ -645,6 +785,11 @@ def screen(
     survivor_observations: list[tuple[CandidateConfig, list[ScreeningObservation]]] = []
     grid_dispositions: list[ScreeningResult] = []
     adaptive_dispositions: list[ScreeningResult] = []
+
+    # For memory objective, seed survivors with the baseline observation
+    if (objective == "memory" and baseline_result.success
+            and baseline_result.observation is not None):
+        survivor_observations.append((base_candidate, [baseline_result.observation]))
 
     for candidate in grid:
         if candidate == base_candidate:
@@ -724,26 +869,47 @@ def screen(
         rc = _build_result(candidate, obs_list, base_pp_med, base_tg_med)
         scored.append(rc)
 
-    # Pareto dominance pruning - preserve observation for pruned candidates
-    kept_scored, pruned_indices = _prune_dominated(scored)
-    for idx in pruned_indices:
-        rc = scored[idx]
-        for gidx, d in enumerate(grid_dispositions):
-            if d.candidate == rc.candidate and d.success and d.observation is not None:
-                grid_dispositions[gidx] = ScreeningResult(
-                    candidate=rc.candidate, success=False,
-                    disposition="dominance_pruned", observation=d.observation,
-                    reason=f"Dominated by another survivor in both PP and TG; "
-                           f"PP={rc.pp_score:.4f} TG={rc.tg_score:.4f}",
-                    provenance=d.provenance,
-                )
-                break
+    # Pareto dominance pruning — skip for memory objective (retain all scored)
+    if objective == "memory":
+        kept_scored = list(scored)
+        pruned_indices: set[int] = set()
+    else:
+        kept_scored, pruned_indices = _prune_dominated(scored)
+        for idx in pruned_indices:
+            rc = scored[idx]
+            for gidx, d in enumerate(grid_dispositions):
+                if d.candidate == rc.candidate and d.success and d.observation is not None:
+                    grid_dispositions[gidx] = ScreeningResult(
+                        candidate=rc.candidate, success=False,
+                        disposition="dominance_pruned", observation=d.observation,
+                        reason=f"Dominated by another survivor in both PP and TG; "
+                               f"PP={rc.pp_score:.4f} TG={rc.tg_score:.4f}",
+                        provenance=d.provenance,
+                    )
+                    break
 
     kept_scored.sort(key=_sort_key(objective))
     ranked = _rank_and_tiebreak(kept_scored, profile, objective)
 
+    # Pareto frontier (speed vs memory) — includes ALL scored candidates
+    # with complete metrics, not just PP/TG dominance survivors
+    frontier = _compute_pareto_frontier(scored, memory_unified)
+
     leader: ProvisionalLeader | None = None
-    if ranked:
+    if objective == "memory":
+        mem_idx = _memory_leader(
+            ranked, resource_budget, memory_unified,
+            dispersion_threshold=profile.dispersion_threshold,
+        )
+        if mem_idx is not None:
+            best = ranked[mem_idx]
+            leader = ProvisionalLeader(
+                candidate=best.candidate, objective=objective,
+                pp_score=best.pp_score, tg_score=best.tg_score,
+                balanced=best.balanced, pp_median=best.pp_median,
+                tg_median=best.tg_median,
+            )
+    elif ranked:
         best = ranked[0]
         leader = ProvisionalLeader(
             candidate=best.candidate, objective=objective,
@@ -767,6 +933,7 @@ def screen(
         attempts_used=profile.max_attempts - remaining,
         objective=objective,
         disposition_summary=summary,
+        pareto_frontier=tuple(frontier),
     )
 
 
@@ -789,10 +956,27 @@ def validate_shortlist(
     objective: str = "balanced",
     budget: int = 10,
     evaluator: ValidationEvaluator,
+    resource_budget: ResourceBudget | None = None,
+    memory_unified: bool = False,
 ) -> ValidatedRecommendation | NoWinnerReport:
-    if objective not in ("pp", "tg", "balanced"):
+    if objective not in ("pp", "tg", "balanced", "memory"):
         raise ValueError(
-            f"Objective must be 'pp', 'tg', or 'balanced', got {objective!r}",
+            f"Objective must be 'pp', 'tg', 'balanced', or 'memory', "
+            f"got {objective!r}",
+        )
+
+    if objective == "memory" and resource_budget is None:
+        return NoWinnerReport(
+            provisional_leader=screening_report.leader,
+            failures=(
+                FailedValidation(
+                    candidate=screening_report.baseline_disposition.candidate,
+                    disposition="systemic_error",
+                    reason="Memory objective requires a ResourceBudget but none was provided",
+                ),
+            ),
+            attempts_used=0,
+            budget=budget,
         )
 
     base_pp, base_tg = _baseline_medians(screening_report)
@@ -800,6 +984,8 @@ def validate_shortlist(
     successes: list[ValidatedCandidate] = []
     failures: list[FailedValidation] = []
     attempts = 0
+    # Collect validated observations for frontier computation
+    validated_observations: list[ScreeningObservation] = []
 
     for survivor in screening_report.survivors:
         if attempts >= budget:
@@ -842,6 +1028,72 @@ def validate_shortlist(
             ))
             continue
 
+        # Collect for frontier computation (complete metrics only filtered later)
+        validated_observations.append(obs)
+
+        # Memory objective: stability check (PP and TG both within threshold)
+        if objective == "memory":
+            pp_rd = _relative_dispersion(
+                _median(obs.pp_samples),
+                _pop_stddev(obs.pp_samples),
+            )
+            tg_rd = _relative_dispersion(
+                _median(obs.tg_samples),
+                _pop_stddev(obs.tg_samples),
+            )
+            threshold = screening_report.profile.dispersion_threshold
+            if pp_rd > threshold or tg_rd > threshold:
+                failures.append(FailedValidation(
+                    candidate=survivor.candidate,
+                    disposition="systemic_error",
+                    reason=f"Unstable: PP dispersion {pp_rd:.4f} > {threshold} "
+                           f"or TG dispersion {tg_rd:.4f} > {threshold}",
+                ))
+                continue
+
+        # Memory objective: check complete in-budget evidence
+        if objective == "memory" and resource_budget is not None:
+            me = obs.memory
+            if me is None or me.quality != "complete":
+                failures.append(FailedValidation(
+                    candidate=survivor.candidate,
+                    disposition="systemic_error",
+                    reason="Incomplete memory metrics: cannot validate memory fit",
+                ))
+                continue
+            headroom = resource_budget.headroom_ratio
+            if memory_unified or resource_budget.vram_bytes is None:
+                cap = int(resource_budget.ram_bytes * (1 - headroom))
+                if me.ram_bytes is None or me.ram_bytes > cap:
+                    failures.append(FailedValidation(
+                        candidate=survivor.candidate,
+                        disposition="systemic_error",
+                        reason=f"Memory exceeds budget: RAM {me.ram_bytes} > {cap}",
+                    ))
+                    continue
+            else:
+                ram_cap = int(resource_budget.ram_bytes * (1 - headroom))
+                vram_cap = int(resource_budget.vram_bytes * (1 - headroom))
+                if me.ram_bytes is None or me.vram_bytes is None:
+                    failures.append(FailedValidation(
+                        candidate=survivor.candidate,
+                        disposition="systemic_error",
+                        reason="Incomplete discrete memory metrics",
+                    ))
+                    continue
+                over_parts: list[str] = []
+                if me.ram_bytes > ram_cap:
+                    over_parts.append(f"RAM {me.ram_bytes} > {ram_cap}")
+                if me.vram_bytes > vram_cap:
+                    over_parts.append(f"VRAM {me.vram_bytes} > {vram_cap}")
+                if over_parts:
+                    failures.append(FailedValidation(
+                        candidate=survivor.candidate,
+                        disposition="systemic_error",
+                        reason="Memory exceeds budget: " + "; ".join(over_parts),
+                    ))
+                    continue
+
         ranked = _build_result(survivor.candidate, [obs], base_pp, base_tg)
         successes.append(ValidatedCandidate(
             candidate=ranked.candidate,
@@ -852,8 +1104,20 @@ def validate_shortlist(
             tg_median=ranked.tg_median,
             pp_relative_dispersion=ranked.pp_relative_dispersion,
             tg_relative_dispersion=ranked.tg_relative_dispersion,
+            memory_evidence=obs.memory,
         ))
         successes.sort(key=_validation_sort_key(objective))
+
+    # Build validation-context Pareto frontier from all validated observations
+    # with complete comparable metrics (including those exceeding budget)
+    v_frontier_raw: list[RankedCandidate] = []
+    for sobs in validated_observations:
+        me = sobs.memory
+        if me is not None and me.quality == "complete":
+            rc = _build_result(sobs.candidate, [sobs], base_pp, base_tg)
+            v_frontier_raw.append(rc)
+
+    v_frontier = _compute_pareto_frontier(v_frontier_raw, memory_unified)
 
     if successes:
         return ValidatedRecommendation(
@@ -862,6 +1126,7 @@ def validate_shortlist(
             failures=tuple(failures),
             attempts_used=attempts,
             budget=budget,
+            pareto_frontier=tuple(v_frontier),
         )
 
     return NoWinnerReport(
@@ -869,6 +1134,7 @@ def validate_shortlist(
         failures=tuple(failures),
         attempts_used=attempts,
         budget=budget,
+        pareto_frontier=tuple(v_frontier),
     )
 
 

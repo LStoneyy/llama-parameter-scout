@@ -1423,12 +1423,19 @@ class Application:
         _validate_request(request)
 
         if evaluator is not None:
+            inj_budget = session_spec.budget if session_spec is not None else None
+            inj_memory_unified = (
+                session_spec.topology.memory_unified
+                if session_spec is not None else False
+            )
             return _search_screen(
                 base_candidate=request.candidate,
                 profile=profile,
                 evaluator=evaluator,
                 screening_n_ctx=SCREENING_N_CTX,
                 objective=objective,
+                resource_budget=inj_budget,
+                memory_unified=inj_memory_unified,
             )
 
         # Inspect toolchain and model once, before the search.
@@ -1540,6 +1547,12 @@ class Application:
                 provenance=_provenance_for(candidate),
             )
 
+        budget = session_spec.budget if session_spec is not None else None
+        memory_unified = (
+            session_spec.topology.memory_unified
+            if session_spec is not None else False
+        )
+
         report = _search_screen(
             base_candidate=request.candidate,
             profile=profile,
@@ -1547,6 +1560,8 @@ class Application:
             screening_n_ctx=SCREENING_N_CTX,
             objective=objective,
             grid=expanded_grid,
+            resource_budget=budget,
+            memory_unified=memory_unified,
         )
 
         notes: list[str] = []
@@ -1577,6 +1592,7 @@ class Application:
                 objective=report.objective,
                 disposition_summary=report.disposition_summary,
                 notes=tuple(notes),
+                pareto_frontier=report.pareto_frontier,
             )
 
         return report
@@ -1595,12 +1611,19 @@ class Application:
         _validate_request(request)
 
         if validation_evaluator is not None:
+            ve_budget = session_spec.budget if session_spec is not None else None
+            ve_memory_unified = (
+                session_spec.topology.memory_unified
+                if session_spec is not None else False
+            )
             return _validate_shortlist(
                 screening_report=screening_report,
                 requested_n_ctx=request.n_ctx,
                 objective=objective,
                 budget=budget,
                 evaluator=validation_evaluator,
+                resource_budget=ve_budget,
+                memory_unified=ve_memory_unified,
             )
 
         try:
@@ -1617,6 +1640,7 @@ class Application:
                 ),
                 attempts_used=0,
                 budget=budget,
+                pareto_frontier=screening_report.pareto_frontier,
             )
 
         try:
@@ -1633,6 +1657,7 @@ class Application:
                 ),
                 attempts_used=0,
                 budget=budget,
+                pareto_frontier=screening_report.pareto_frontier,
             )
 
         def _production_validator(
@@ -1644,12 +1669,20 @@ class Application:
                 toolchain, model, session_spec, policy,
             )
 
+        res_budget = session_spec.budget if session_spec is not None else None
+        mem_unified = (
+            session_spec.topology.memory_unified
+            if session_spec is not None else False
+        )
+
         return _validate_shortlist(
             screening_report=screening_report,
             requested_n_ctx=request.n_ctx,
             objective=objective,
             budget=budget,
             evaluator=_production_validator,
+            resource_budget=res_budget,
+            memory_unified=mem_unified,
         )
 
     def run(

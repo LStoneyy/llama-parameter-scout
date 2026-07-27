@@ -2,8 +2,8 @@
 
 Benchmark llama.cpp models across candidate configurations by driving `llama-bench` with explicit settings, collecting throughput samples, and journaling results.
 
-> **Status:** issue 07 - full-context validation of screened finalists.
-> No resource-budget recommendations, resume, or TUI yet.
+> **Status:** issue 08 - resource-budget recommendations with memory objective.
+> No resume, TUI, or MTP yet.
 
 ## Setup
 
@@ -328,6 +328,98 @@ result = validate_shortlist(
 ```
 
 See `tests/test_issue07.py` for comprehensive validation tests covering OOM finalists, rank reversal, budget exhaustion, all-fail/no-winner, context mismatch, exactly three successes, and objective-specific ranking (pp, tg, balanced).
+
+## Resource Budget (issue 08)
+
+The `memory` objective selects the fastest stable candidate with complete comparable evidence that fits within the resource budget.
+
+### Memory evidence model
+
+```python
+@dataclass(frozen=True)
+class MemoryEvidence:
+    ram_bytes: int | None = None        # system RAM usage
+    vram_bytes: int | None = None       # device VRAM usage (None for unified)
+    quality: MemoryQuality | None = None  # None = missing
+
+MemoryQuality = Literal["complete", "partial", "estimated", "incomparable"]
+```
+
+- `complete`: measured process memory during the run.
+- `partial`: only one of RAM/VRAM was measured (discrete systems).
+- `estimated`: derived from heuristics, not measured.
+- `incomparable`: measured but under incomparable conditions.
+- `None` (missing): not measured at all (e.g. production workload cannot track process memory).
+
+Missing values are `None`, never zero.
+
+### Memory objective behavior
+
+When `objective="memory"`:
+
+1. **Complete evidence required** — only candidates with `quality="complete"` on all constrained resources are eligible. Partial/estimated/incomparable/missing evidence cannot establish under-limit status and cannot select a memory leader.
+2. **Budget enforcement** — on discrete GPU systems, both `ram_bytes` and `vram_bytes` must be present and independently within their configured caps (after headroom). On unified/CPU topology, the single RAM measurement must fit the RAM cap.
+3. **Speed measure** — balanced throughput (`sqrt(pp_score * tg_score)`) is used as the speed measure.
+4. **Stability** — existing profile dispersion policy applies (no leader if dispersion exceeds threshold).
+5. **Eligible candidates** — survivors list may retain candidates regardless of memory eligibility, but only a fully qualifying candidate can be the memory leader.
+
+### No-winner semantics
+
+When no validated candidate has complete in-budget stable evidence, `validate_shortlist` returns a `NoWinnerReport` with actionable failure reasons that distinguish:
+- **No fit**: candidate memory exceeds budget.
+- **Incomplete metrics**: memory evidence is missing or not `complete`.
+
+Screening returns `leader=None` when no candidate qualifies.
+
+### Pareto frontier (speed vs memory)
+
+A speed-vs-memory Pareto frontier is computed for every screening and validation report. It includes all candidates with complete comparable metrics (not only PP/TG dominance survivors). A candidate is dominated when another has `>=` balanced speed and `<=` every constrained memory resource, with at least one strict improvement.
+
+```python
+@dataclass(frozen=True)
+class ParetoEntry:
+    candidate: CandidateConfig
+    balanced: float
+    memory: MemoryEvidence
+```
+
+The frontier is available as `ScreeningReport.pareto_frontier` and `ValidatedRecommendation.pareto_frontier`.
+
+### Usage
+
+```python
+from llama_parameter_scout.search import screen
+from llama_parameter_scout.models import ResourceBudget
+
+budget = ResourceBudget(ram_bytes=32_000_000_000, vram_bytes=None, headroom_ratio=0.1)
+report = screen(
+    base_candidate=base,
+    profile=STANDARD_PROFILE,
+    evaluator=evaluator,
+    screening_n_ctx=SCREENING_N_CTX,
+    objective="memory",
+    resource_budget=budget,
+    memory_unified=True,
+)
+# report.leader — fastest stable candidate with complete in-budget evidence, or None
+# report.pareto_frontier — speed-vs-memory frontier entries
+```
+
+`Application.screen_candidates()` and `Application.validate_candidates()` derive `resource_budget` and `memory_unified` from the `SessionSpecification` when provided.
+
+### Production workload limitation
+
+The production workload (`_run_screening_workload`) currently cannot measure process memory. Its resulting evidence is `None` (missing) — never synthesized from advisory estimates as observed complete evidence. This means **production alone cannot claim a memory winner** until an injected or real measurement source supplies complete metrics. To use the memory objective in production, inject an evaluator that attaches measured `MemoryEvidence(quality="complete")` observations.
+
+### Tests
+
+Run the issue 08 test suite:
+
+```bash
+uv run pytest tests/test_issue08.py -v
+```
+
+See `tests/test_issue08.py` for acceptance tests covering: fastest stable fit, no-fit, no-complete-metrics, discrete RAM/VRAM enforcement, unified enforcement, Pareto frontier (dominated exclusion, incomplete exclusion), evidence quality labels, validation no-winner semantics, and Application seam budget/topology propagation.
 
 ## Tests
 
