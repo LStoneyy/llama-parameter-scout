@@ -31,8 +31,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/lukas/llama-parameter-scout"
-Source = "https://github.com/lukas/llama-parameter-scout"
+Homepage = "https://github.com/LStoneyy/llama-parameter-scout"
+Source = "https://github.com/LStoneyy/llama-parameter-scout"
 
 [project.scripts]
 llama-parameter-scout = "llama_parameter_scout.cli:main"
