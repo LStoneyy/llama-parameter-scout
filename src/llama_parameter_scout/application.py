@@ -19,6 +19,7 @@ from .journal import (
 from .journal import (
     read_journal_events,
     write_measurement_completed,
+    write_mtp_evidence,
     write_observation,
     write_outcome,
     write_search_decision,
@@ -46,6 +47,7 @@ from .models import (
     ModelFingerprint,
     ModelFingerprintMismatchError,
     ModelNotFoundError,
+    MtpComparison,
     MultipleAcceleratorsSelectedError,
     NctxComposition,
     NoAcceleratorSelectedError,
@@ -70,6 +72,7 @@ from .models import (
     UnknownDeviceError,
     ValidatedRecommendation,
 )
+from .mtp import ServerLifecycle
 from .runner import (
     ProcessAdapter,
     ProcessResult,
@@ -2019,6 +2022,74 @@ class Application:
             raise JournalError(f"Failed to write journal: {e}") from e
 
         return observation
+
+    # ── MTP comparison seam ───────────────────────────────────────
+
+    def compare_mtp(
+        self,
+        *,
+        candidate: CandidateConfig,
+        main_model_path: Path,
+        draft_model_path: Path,
+        server_path: Path,
+        n_ctx: NctxComposition,
+        cpu_only: bool = True,
+        device_id: int | None = None,
+        session_spec: SessionSpecification | None = None,
+        journal_path: Path | None = None,
+        session_id: str | None = None,
+        parent_session_id: str | None = None,
+        server_lifecycle: ServerLifecycle | None = None,
+        main_fingerprint: ModelFingerprint | None = None,
+        draft_fingerprint: ModelFingerprint | None = None,
+        _warmup_fn: Callable[[int], None] | None = None,
+        _measure_fn: Callable[[int], float] | None = None,
+    ) -> MtpComparison:
+        from .mtp import collect_mtp_evidence as _collect_mtp_evidence
+
+        if session_spec is not None:
+            cpu_only = session_spec.cpu_only
+            device_id = (
+                session_spec.selected_device_ids[0]
+                if session_spec.selected_device_ids
+                else None
+            )
+
+        _validate_nctx_at_setup(n_ctx)
+        _validate_ngl_consistency(cpu_only, candidate.n_gpu_layers)
+        if not cpu_only and device_id is not None:
+            _validate_device_selection(
+                session_spec.topology if session_spec else self._detect_topology(),
+                cpu_only,
+                (device_id,) if device_id is not None else (),
+            )
+
+        main_fp = main_fingerprint or inspect_model(main_model_path)
+        draft_fp = draft_fingerprint or inspect_model(draft_model_path)
+
+        evidence = _collect_mtp_evidence(
+            candidate=candidate,
+            main_model_path=main_model_path,
+            draft_model_path=draft_model_path,
+            server_path=server_path,
+            n_ctx=n_ctx,
+            cpu_only=cpu_only,
+            device_id=device_id,
+            runner=self._runner,
+            server_lifecycle=server_lifecycle,
+            main_fingerprint=main_fp,
+            draft_fingerprint=draft_fp,
+            _warmup_fn=_warmup_fn,
+            _measure_fn=_measure_fn,
+        )
+
+        if journal_path is not None:
+            write_mtp_evidence(
+                journal_path, evidence,
+                session_id=session_id, parent_session_id=parent_session_id,
+            )
+
+        return evidence.comparison
 
     # ── Export seam ───────────────────────────────────────────────
 

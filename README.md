@@ -2,10 +2,10 @@
 
 Benchmark llama.cpp models across candidate configurations by driving `llama-bench` with explicit settings, collecting throughput samples, and journaling results.
 
-> **Status:** issue 10 — export reproducible and share-safe artifacts
-> with versioned private JSON, redacted Markdown reports, shell quoting
-> across POSIX/PowerShell/cmd, reproduction argv, and preset.ini generation.
-> No TUI or MTP yet.
+> **Status:** issue 11 — MTP (Multi-Token Prediction) comparison
+> with local draft model, ephemeral loopback-only llama-server,
+> paired MTP-off/MTP-on evidence, dispersion-based tie detection,
+> and explicit synthetic-throughput caveats.
 
 ## Setup
 
@@ -520,6 +520,88 @@ cache_type_v = f16
 
 The `LaunchProvenance` dataclass accepts structured provenance as input rather than claiming runtime-captured values. Only environment fields actually needed by the session (e.g. `CUDA_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`) are included — secrets are never exposed wholesale.
 
+## MTP (Multi-Token Prediction) comparison
+
+A local draft GGUF model and a llama-server binary are accepted as inputs to compare generation throughput with MTP off vs MTP on using identical main-model settings, device, effective context, and deterministic synthetic generation/sampling settings.
+
+### Requirements
+
+- **llama-server binary** — must provide a parseable version and advertise the exact flags used by the selected CPU, GPU, or MoE launch through `--help` or structured `supported_flags:` output. It is inspected before any benchmark server process is launched.
+- **Draft GGUF** — must have the same architecture as the main model. If both specify a context length, the draft context must be >= main context. If both specify a parameter count, the draft parameter count must be less than the main. Missing metadata is tolerated but validated conservatively when present.
+- All draft shards are resolved and fingerprinted through the existing `inspect_model` function.
+
+### Loopback-only
+
+The server is launched on `127.0.0.1` only, using an ephemeral OS-assigned port. The `--host` flag is always `127.0.0.1`; `0.0.0.0` is never used. HTTP health checks and completion requests are loopback-only via `urllib.request`.
+
+### Port-race handling
+
+If a port becomes occupied between selection and process startup, a bounded number of retries (up to 5) with fresh ephemeral ports is attempted. The port is obtained by binding to port 0 on `127.0.0.1` and releasing.
+
+### Process cleanup
+
+The server process tree is terminated on normal return and on every `BaseException`. Cleanup is guaranteed through `try/finally` blocks: both the off-mode and on-mode servers are stopped after measurement or on any error in the lifecycle.
+
+### Paired evidence
+
+Each mode receives:
+1. **Warmup** — one completion request (startup and model-loading time excluded from measurement).
+2. **Measurement** — at least 3 completed repetitions with identical deterministic synthetic input (`prompt="The"`, `n_predict=128`, `temperature=0.0`, stream off, cache off).
+3. **Statistics** — median throughput and population standard deviation (dispersion).
+
+It is acceptable to run one ephemeral server per mode if settings are paired and lifecycle cleanup is guaranteed.
+
+### Benefit determination
+
+Benefit is established only when:
+```
+on_median - off_median > max(off_dispersion, on_dispersion)
+```
+This is the dispersion-derived tie/noise bound. If improvement does not exceed the bound, the benefit is stated as `not_established` and MTP off is not displaced.
+
+### Evidence caveats
+
+The `MtpComparison` carries the following caveat on every result:
+
+> Measured synthetic generation throughput only. Does not cover prompt processing, output quality, representative workloads, acceptance under real prompts, or universal end-to-end speedup.
+
+### Journal event
+
+MTP evidence is journaled as a dedicated `mtp_evidence` event type, separate from `observation_completed` and `measurement_completed` events. The event carries both model fingerprints, exact server capabilities and mode argv, fixed settings, and the full `MtpComparison`.
+
+### Usage via Application
+
+```python
+from llama_parameter_scout.application import Application
+from llama_parameter_scout.models import CandidateConfig, NctxComposition
+
+app = Application(runner)
+
+comparison = app.compare_mtp(
+    candidate=CandidateConfig(threads=4, batch_size=512, ubatch_size=512, ...),
+    main_model_path=Path("/path/to/main.gguf"),
+    draft_model_path=Path("/path/to/draft.gguf"),
+    server_path=Path("/path/to/llama-server"),
+    n_ctx=NctxComposition(total=2048, prompt=512, generation=1024, depth=512),
+    cpu_only=True,
+    journal_path=Path("./journal.json"),
+)
+
+print(comparison.benefit)        # "established" or "not_established"
+print(comparison.improvement_pct)  # float or None
+print(comparison.off.median_tps)
+print(comparison.on.median_tps)
+```
+
+### Injection seam
+
+```python
+from llama_parameter_scout.mtp import FakeServerLifecycle
+
+lifecycle = FakeServerLifecycle()
+result = app.compare_mtp(..., server_lifecycle=lifecycle)
+```
+
 ## Tests
 
 ```bash
@@ -534,6 +616,7 @@ uv run pytest tests/test_application.py -v
 uv run pytest tests/test_cli.py -v
 uv run pytest tests/test_issue09.py -v
 uv run pytest tests/test_issue10.py -v
+uv run pytest tests/test_issue11.py -v
 
 # Type check
 uv run mypy src tests
@@ -605,7 +688,7 @@ Each run writes a v5 JSON envelope containing an ordered `events` collection:
 
 `shards` contains one fingerprint entry per shard file path (with `size_bytes`, `modified_time`, `digest_sha256`) when the model is a split shard set; an empty array for a single file.
 
-Event types: `session_start`, `observation_completed`, `outcome_recorded`, `search_decision`.
+Event types: `session_start`, `observation_completed`, `outcome_recorded`, `search_decision`, `mtp_evidence`.
 
 ### Session resume / derive
 

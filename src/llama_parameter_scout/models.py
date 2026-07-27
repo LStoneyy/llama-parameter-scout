@@ -75,6 +75,18 @@ class ModelFingerprintMismatchError(SessionSetupError):
     """Session spec model fingerprint does not match inspected model."""
 
 
+class IncompatibleDraftError(ScoutError):
+    """Main model and draft model are not compatible for MTP."""
+
+
+class ServerCapabilityError(ScoutError):
+    """llama-server does not support required capabilities."""
+
+
+class MtpMeasurementError(ServerCapabilityError):
+    """Server completion response was malformed or invalid."""
+
+
 # ── Execution domain models ─────────────────────────────────────
 
 
@@ -520,3 +532,43 @@ class LaunchProvenance:
                 f"shell_dialect must be 'posix', 'powershell', or 'cmd', "
                 f"got {self.shell_dialect!r}"
             )
+
+
+# ── MTP domain models ─────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class MtpMeasurement:
+    mode: str
+    samples_tps: tuple[float, ...]
+    median_tps: float
+    dispersion_tps: float
+
+
+MtpBenefit = Literal["established", "not_established"]
+
+
+@dataclass(frozen=True)
+class MtpComparison:
+    off: MtpMeasurement
+    on: MtpMeasurement
+    benefit: MtpBenefit
+    improvement_pct: float | None
+    tie_bound_tps: float
+    caveat: str = ""
+
+
+@dataclass(frozen=True)
+class MtpEvidence:
+    main_fingerprint: ModelFingerprint
+    draft_fingerprint: ModelFingerprint
+    server_path: str
+    server_version: str
+    server_supported_flags: tuple[str, ...]
+    candidate: CandidateConfig
+    n_ctx: NctxComposition
+    cpu_only: bool
+    device_id: int | None
+    off_argv: tuple[str, ...]
+    on_argv: tuple[str, ...]
+    comparison: MtpComparison
