@@ -7,24 +7,47 @@ import pytest
 
 from llama_parameter_scout.application import (
     Application,
-    BinaryNotFoundError,
-    CandidateError,
-    InvalidNctxError,
-    JournalError,
-    MalformedOutputError,
-    ModelNotFoundError,
-    SubprocessError,
     _build_argv,
     _compute_stats,
     _parse_measurements,
     _validate_request,
 )
 from llama_parameter_scout.models import (
+    BinaryNotFoundError,
     CandidateConfig,
+    CandidateError,
+    InvalidNctxError,
+    JournalError,
+    MalformedOutputError,
+    ModelFingerprint,
+    ModelNotFoundError,
     NctxComposition,
     SingleRunRequest,
+    SubprocessError,
+    ToolchainError,
+    ToolchainFingerprint,
 )
 from llama_parameter_scout.runner import FakeRunner, ProcessResult
+
+
+def _enqueue_toolchain(runner: FakeRunner, bp: Path) -> None:
+    runner.enqueue(
+        (str(bp), "--version"),
+        ProcessResult(
+            returncode=0,
+            stdout=(
+                "version: test123\n"
+                "backends: cpu\n"
+                "supported_flags: -m,-p,-n,-d,-t,-b,-ub,-ngl,-fa,-ctk,-ctv,-o,-r\n"
+                "supported_output_formats: json\n"
+            ),
+            stderr="",
+        ),
+    )
+    runner.enqueue(
+        (str(bp), "--help"),
+        ProcessResult(returncode=0, stdout="usage: llama-bench\n", stderr=""),
+    )
 
 
 class TestBuildArgv:
@@ -263,7 +286,6 @@ class TestComputeStats:
 
     def test_known_dispersion(self) -> None:
         _, dispersion = _compute_stats([1.0, 2.0, 3.0])
-        # population stddev = sqrt((1+0+1)/3) = sqrt(2/3), approximately 0.8165
         assert dispersion == pytest.approx(0.81649658, rel=1e-6)
 
 
@@ -274,6 +296,7 @@ class TestApplication:
         fake_runner: FakeRunner,
         valid_json_output: str,
     ) -> None:
+        _enqueue_toolchain(fake_runner, valid_request.binary_path)
         warmup_argv = _build_argv(valid_request, repetitions=1)
         measure_argv = _build_argv(valid_request, repetitions=3)
         fake_runner.enqueue(
@@ -294,16 +317,118 @@ class TestApplication:
         assert obs.depth_ctx == 512
         assert obs.samples_tps == (45.5, 44.8, 45.3)
         assert obs.median_tps == pytest.approx(45.3, rel=1e-6)
-        assert len(fake_runner.calls) == 2
+        assert len(fake_runner.calls) == 4
 
         assert valid_request.journal_path.exists()
         journal = json.loads(valid_request.journal_path.read_text())
-        assert journal["version"] == 1
+        assert journal["version"] == 2
         assert journal["candidate"]["threads"] == 4
         assert journal["total_ctx"] == 2048
         assert journal["samples_tps"] == [45.5, 44.8, 45.3]
         assert journal["median_tps"] == obs.median_tps
         assert journal["n_measurements"] == 3
+        assert journal["binary_path"] == str(valid_request.binary_path)
+        assert journal["binary_source"] == "explicit"
+        assert journal["model_path"] == str(valid_request.model_path)
+
+    def test_on_ready_called_before_warmup(
+        self,
+        valid_request: SingleRunRequest,
+        fake_runner: FakeRunner,
+        valid_json_output: str,
+    ) -> None:
+        _enqueue_toolchain(fake_runner, valid_request.binary_path)
+        warmup_argv = _build_argv(valid_request, repetitions=1)
+        measure_argv = _build_argv(valid_request, repetitions=3)
+        fake_runner.enqueue(
+            warmup_argv,
+            ProcessResult(returncode=0, stdout=valid_json_output, stderr=""),
+        )
+        fake_runner.enqueue(
+            measure_argv,
+            ProcessResult(returncode=0, stdout=valid_json_output, stderr=""),
+        )
+        ready_calls: list[tuple[ToolchainFingerprint, ModelFingerprint]] = []
+
+        def on_ready(tc: ToolchainFingerprint, m: ModelFingerprint) -> None:
+            ready_calls.append((tc, m))
+
+        app = Application(fake_runner)
+        app.run(valid_request, on_ready=on_ready)
+
+        assert len(ready_calls) == 1
+        tc, m = ready_calls[0]
+        assert tc.version == "test123"
+        assert m.architecture == "llama"
+        toolchain_calls = [c for c in fake_runner.calls if "--version" in c or "--help" in c]
+        warmup_calls = [c for c in fake_runner.calls if "-r" in c and "1" in c[-1]]
+        assert len(toolchain_calls) == 2
+        assert len(warmup_calls) == 1
+        toolchain_last_idx = max(
+            fake_runner.calls.index(c) for c in toolchain_calls
+        )
+        warmup_idx = fake_runner.calls.index(warmup_calls[0])
+        assert toolchain_last_idx < warmup_idx
+
+    def test_toolchain_in_observation(
+        self,
+        valid_request: SingleRunRequest,
+        fake_runner: FakeRunner,
+        valid_json_output: str,
+    ) -> None:
+        _enqueue_toolchain(fake_runner, valid_request.binary_path)
+        warmup_argv = _build_argv(valid_request, repetitions=1)
+        measure_argv = _build_argv(valid_request, repetitions=3)
+        fake_runner.enqueue(
+            warmup_argv,
+            ProcessResult(returncode=0, stdout=valid_json_output, stderr=""),
+        )
+        fake_runner.enqueue(
+            measure_argv,
+            ProcessResult(returncode=0, stdout=valid_json_output, stderr=""),
+        )
+        app = Application(fake_runner)
+        obs = app.run(valid_request)
+
+        assert obs.toolchain.binary_path == valid_request.binary_path
+        assert obs.toolchain.version == "test123"
+
+    def test_model_in_observation(
+        self,
+        valid_request: SingleRunRequest,
+        fake_runner: FakeRunner,
+        valid_json_output: str,
+    ) -> None:
+        _enqueue_toolchain(fake_runner, valid_request.binary_path)
+        warmup_argv = _build_argv(valid_request, repetitions=1)
+        measure_argv = _build_argv(valid_request, repetitions=3)
+        fake_runner.enqueue(
+            warmup_argv,
+            ProcessResult(returncode=0, stdout=valid_json_output, stderr=""),
+        )
+        fake_runner.enqueue(
+            measure_argv,
+            ProcessResult(returncode=0, stdout=valid_json_output, stderr=""),
+        )
+        app = Application(fake_runner)
+        obs = app.run(valid_request)
+
+        assert obs.model.architecture == "llama"
+
+    def test_toolchain_inspection_failure_before_warmup(
+        self,
+        valid_request: SingleRunRequest,
+        fake_runner: FakeRunner,
+    ) -> None:
+        bp = valid_request.binary_path
+        fake_runner.enqueue(
+            (str(bp), "--version"),
+            ProcessResult(returncode=1, stdout="", stderr="not found"),
+        )
+        app = Application(fake_runner)
+        with pytest.raises(ToolchainError):
+            app.run(valid_request)
+        assert len(fake_runner.calls) == 1
 
     def test_warmup_failure(
         self,
@@ -311,6 +436,7 @@ class TestApplication:
         fake_runner: FakeRunner,
         valid_json_output: str,
     ) -> None:
+        _enqueue_toolchain(fake_runner, valid_request.binary_path)
         warmup_argv = _build_argv(valid_request, repetitions=1)
         fake_runner.enqueue(
             warmup_argv,
@@ -326,6 +452,7 @@ class TestApplication:
         fake_runner: FakeRunner,
         valid_json_output: str,
     ) -> None:
+        _enqueue_toolchain(fake_runner, valid_request.binary_path)
         warmup_argv = _build_argv(valid_request, repetitions=1)
         measure_argv = _build_argv(valid_request, repetitions=3)
         fake_runner.enqueue(
@@ -345,6 +472,7 @@ class TestApplication:
         valid_request: SingleRunRequest,
         fake_runner: FakeRunner,
     ) -> None:
+        _enqueue_toolchain(fake_runner, valid_request.binary_path)
         warmup_argv = _build_argv(valid_request, repetitions=1)
         measure_argv = _build_argv(valid_request, repetitions=3)
         fake_runner.enqueue(
@@ -364,6 +492,7 @@ class TestApplication:
         valid_request: SingleRunRequest,
         fake_runner: FakeRunner,
     ) -> None:
+        _enqueue_toolchain(fake_runner, valid_request.binary_path)
         warmup_argv = _build_argv(valid_request, repetitions=1)
         fake_runner.enqueue(
             warmup_argv,
@@ -379,6 +508,7 @@ class TestApplication:
         fake_runner: FakeRunner,
         valid_json_output: str,
     ) -> None:
+        _enqueue_toolchain(fake_runner, valid_request.binary_path)
         warmup_argv = _build_argv(valid_request, repetitions=1)
         measure_argv = _build_argv(valid_request, repetitions=3)
         fake_runner.enqueue(
@@ -389,7 +519,6 @@ class TestApplication:
             measure_argv,
             ProcessResult(returncode=0, stdout=valid_json_output, stderr=""),
         )
-        # Point journal at a read-only directory parent
         read_only = valid_request.journal_path.parent / "readonly"
         read_only.mkdir(mode=0o444)
         req = SingleRunRequest(

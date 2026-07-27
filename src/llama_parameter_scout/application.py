@@ -3,42 +3,26 @@ from __future__ import annotations
 import json
 import math
 import os
+from collections.abc import Callable
+from typing import Any
 
 from .journal import write_observation
-from .models import BenchmarkObservation, SingleRunRequest
+from .model_inspector import inspect_model
+from .models import (
+    BenchmarkObservation,
+    BinaryNotFoundError,
+    CandidateError,
+    InvalidNctxError,
+    JournalError,
+    MalformedOutputError,
+    ModelFingerprint,
+    ModelNotFoundError,
+    SingleRunRequest,
+    SubprocessError,
+    ToolchainFingerprint,
+)
 from .runner import ProcessRunner
-
-
-class ScoutError(Exception):
-    """Base error for all scout-domain errors."""
-
-
-class BinaryNotFoundError(ScoutError):
-    """The llama-bench binary does not exist or is not executable."""
-
-
-class ModelNotFoundError(ScoutError):
-    """The GGUF model file does not exist."""
-
-
-class InvalidNctxError(ScoutError):
-    """The n_ctx composition is invalid."""
-
-
-class CandidateError(ScoutError):
-    """A candidate configuration value is out of range."""
-
-
-class SubprocessError(ScoutError):
-    """The llama-bench subprocess exited with a non-zero code."""
-
-
-class MalformedOutputError(ScoutError):
-    """llama-bench output could not be parsed as valid machine-readable JSON."""
-
-
-class JournalError(ScoutError):
-    """Failed to atomically write the journal file."""
+from .toolchain import inspect_toolchain
 
 
 def _build_argv(request: SingleRunRequest, *, repetitions: int) -> list[str]:
@@ -207,8 +191,19 @@ class Application:
     def __init__(self, runner: ProcessRunner) -> None:
         self._runner = runner
 
-    def run(self, request: SingleRunRequest) -> BenchmarkObservation:
+    def run(
+        self,
+        request: SingleRunRequest,
+        *,
+        on_ready: Callable[[ToolchainFingerprint, ModelFingerprint], Any] | None = None,
+    ) -> BenchmarkObservation:
         _validate_request(request)
+
+        toolchain = inspect_toolchain(self._runner, request.binary_path)
+        model = inspect_model(request.model_path)
+
+        if on_ready is not None:
+            on_ready(toolchain, model)
 
         warmup_argv = _build_argv(request, repetitions=1)
         warmup_result = self._runner.run(warmup_argv)
@@ -239,6 +234,11 @@ class Application:
             samples_tps=tuple(samples),
             median_tps=median,
             dispersion_tps=dispersion,
+            binary_path=request.binary_path,
+            binary_source=request.binary_source,
+            model_path=request.model_path,
+            toolchain=toolchain,
+            model=model,
         )
 
         try:
