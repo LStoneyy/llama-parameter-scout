@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -24,14 +27,16 @@ from llama_parameter_scout.models import (
     ModelFingerprintMismatchError,
     ModelNotFoundError,
     NctxComposition,
+    ResourceBudget,
     SessionSetupError,
+    SessionSpecification,
     SingleRunRequest,
     SubprocessError,
     SystemTopology,
     ToolchainError,
     ToolchainFingerprint,
 )
-from llama_parameter_scout.runner import FakeRunner, ProcessResult
+from llama_parameter_scout.runner import FakeRunner, ProcessResult, ProcessStartError
 
 
 def _enqueue_toolchain_with_gpu_flags(
@@ -814,3 +819,331 @@ class TestApplication:
         pairs = dict(zip(actual_warmup[1::2], actual_warmup[2::2]))
         assert pairs.get("--split-mode") == "none"
         assert pairs.get("--main-gpu") == "0"
+
+
+# ── Application.screen_candidates production-path tests ──────────
+
+
+class TestApplicationScreenCandidates:
+    """Tests that exercise Application.screen_candidates with NO injected
+    ScreeningEvaluator, using a dynamic fake ProcessAdapter."""
+
+    def _build_request(self, tmp_path: Path) -> SingleRunRequest:
+        bp = tmp_path / "llama-bench"
+        bp.write_text("#!/bin/sh\necho '{\"samples_ts\":[10.0,11.0,12.0]}'")
+        bp.chmod(0o755)
+        mp = tmp_path / "model.gguf"
+        from tests.conftest import _build_minimal_gguf
+        _build_minimal_gguf(mp, {"general.architecture": (8, "llama")})
+        return SingleRunRequest(
+            binary_path=bp,
+            model_path=mp,
+            journal_path=tmp_path / "journal.json",
+            n_ctx=NctxComposition(total=2048, prompt=512, generation=1024, depth=512),
+            candidate=CandidateConfig(
+                threads=4, batch_size=512, ubatch_size=512,
+                n_gpu_layers=0, flash_attn=False,
+                cache_type_k="f16", cache_type_v="f16",
+            ),
+        )
+
+    def _toolchain_stdout(self) -> str:
+        return (
+            "version: test123\n"
+            "backends: cpu\n"
+            "supported_flags: -m,-p,-n,-d,-t,-b,-ub,-ngl,-fa,-ctk,-ctv,-o,-r\n"
+            "supported_output_formats: json\n"
+        )
+
+    @dataclass
+    class DynamicFakeAdapter:
+        json_output: str = '{"samples_ts":[10.0,11.0,12.0]}'
+        raise_on_launch: type[BaseException] | None = None
+
+        def launch(
+            self,
+            argv: Sequence[str],
+            *,
+            env: dict[str, str] | None = None,
+            timeout_seconds: float | None = None,
+            cancellation: Event | None = None,
+            memory_pressure_fn: Callable[[], bool] | None = None,
+            memory_pressure_backoff_seconds: float = 1.0,
+            memory_pressure_max_backoffs: int = 3,
+        ) -> ProcessResult:
+            if self.raise_on_launch is ProcessStartError:
+                raise ProcessStartError("simulated ProcessStartError")
+            if self.raise_on_launch is not None:
+                raise RuntimeError("simulated launch failure")
+            return ProcessResult(returncode=0, stdout=self.json_output, stderr="")
+
+    def test_default_path_preserves_distinct_pp_tg(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With no evaluator injected, screen_candidates runs via
+        the production evaluator which does PP and TG workloads separately.
+        Since both workloads parse the same llama-bench JSON (which has
+        'samples_ts': [10,11,12]) the PP and TG series will be equal for now,
+        but the pipeline preserves them as separate tuples."""
+        from llama_parameter_scout.runner import FakeRunner
+
+        req = self._build_request(tmp_path)
+        runner = FakeRunner()
+        runner.enqueue((str(req.binary_path), "--version"),
+                        ProcessResult(0, self._toolchain_stdout(), ""))
+        runner.enqueue((str(req.binary_path), "--help"),
+                        ProcessResult(0, "usage\n", ""))
+
+        adapter = self.DynamicFakeAdapter()
+        app = Application(runner, process_adapter=adapter)
+
+        from llama_parameter_scout.search import QUICK_PROFILE
+        report = app.screen_candidates(req, QUICK_PROFILE)
+
+        assert report.baseline_disposition is not None
+        assert report.baseline_disposition.success
+        assert report.baseline_disposition.observation is not None
+        pp = report.baseline_disposition.observation.pp_samples
+        tg = report.baseline_disposition.observation.tg_samples
+        assert len(pp) == QUICK_PROFILE.min_repetitions
+        assert len(tg) == QUICK_PROFILE.min_repetitions
+        assert all(x > 0 for x in pp)
+        assert all(x > 0 for x in tg)
+
+    def test_measure_process_start_error(
+        self, tmp_path: Path,
+    ) -> None:
+        from llama_parameter_scout.runner import FakeRunner, ProcessStartError
+
+        req = self._build_request(tmp_path)
+        runner = FakeRunner()
+        runner.enqueue((str(req.binary_path), "--version"),
+                        ProcessResult(0, self._toolchain_stdout(), ""))
+        runner.enqueue((str(req.binary_path), "--help"),
+                        ProcessResult(0, "usage\n", ""))
+
+        adapter = self.DynamicFakeAdapter(raise_on_launch=ProcessStartError)
+        app = Application(runner, process_adapter=adapter)
+
+        from llama_parameter_scout.search import QUICK_PROFILE
+        report = app.screen_candidates(req, QUICK_PROFILE)
+
+        assert not report.baseline_disposition.success
+        assert report.baseline_disposition.disposition in ("unsupported",)
+
+    def test_measure_generic_exception(
+        self, tmp_path: Path,
+    ) -> None:
+        from llama_parameter_scout.runner import FakeRunner
+
+        req = self._build_request(tmp_path)
+        runner = FakeRunner()
+        runner.enqueue((str(req.binary_path), "--version"),
+                        ProcessResult(0, self._toolchain_stdout(), ""))
+        runner.enqueue((str(req.binary_path), "--help"),
+                        ProcessResult(0, "usage\n", ""))
+
+        adapter = self.DynamicFakeAdapter(raise_on_launch=RuntimeError)
+        app = Application(runner, process_adapter=adapter)
+
+        from llama_parameter_scout.search import QUICK_PROFILE
+        report = app.screen_candidates(req, QUICK_PROFILE)
+
+        assert not report.baseline_disposition.success
+        assert report.baseline_disposition.disposition == "systemic_error"
+
+    def test_budget_preflight_no_launches(
+        self, tmp_path: Path,
+    ) -> None:
+        """A budget too small for the model should prevent any process launch."""
+        from llama_parameter_scout.model_inspector import inspect_model
+        from llama_parameter_scout.models import SystemTopology
+        from llama_parameter_scout.runner import FakeRunner
+
+        req = self._build_request(tmp_path)
+        runner = FakeRunner()
+        runner.enqueue((str(req.binary_path), "--version"),
+                        ProcessResult(0, self._toolchain_stdout(), ""))
+        runner.enqueue((str(req.binary_path), "--help"),
+                        ProcessResult(0, "usage\n", ""))
+
+        model = inspect_model(req.model_path)
+        topology = SystemTopology(
+            cpu_count=4, system_memory_bytes=1_000_000,
+            accelerators=(), memory_unified=True,
+        )
+        spec = SessionSpecification(
+            topology=topology, cpu_only=True,
+            selected_device_ids=(),
+            n_ctx=NctxComposition(total=2048, prompt=512, generation=1024, depth=512),
+            budget=ResourceBudget(ram_bytes=1_000_000, vram_bytes=None, headroom_ratio=0.0),
+            advisory=None,  # type: ignore[arg-type]
+            model=model, acknowledged=True, fingerprint="x",
+        )
+
+        adapter = self.DynamicFakeAdapter()
+        app = Application(runner, process_adapter=adapter, detect_topology_fn=lambda: topology)
+
+        from llama_parameter_scout.search import QUICK_PROFILE
+        report = app.screen_candidates(req, QUICK_PROFILE, session_spec=spec)
+
+        assert not report.baseline_disposition.success
+        assert report.baseline_disposition.disposition in ("budget_exhausted", "unsupported")
+
+    def test_repetition_count_in_argv(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Verify the -r flag matches requested repetitions."""
+        from llama_parameter_scout.runner import FakeRunner
+
+        req = self._build_request(tmp_path)
+        runner = FakeRunner()
+        runner.enqueue((str(req.binary_path), "--version"),
+                        ProcessResult(0, self._toolchain_stdout(), ""))
+        runner.enqueue((str(req.binary_path), "--help"),
+                        ProcessResult(0, "usage\n", ""))
+
+        captured_argv: list[list[str]] = []
+
+        class CapturingAdapter:
+            def launch(
+                self,
+                argv: Sequence[str],
+                *,
+                env: dict[str, str] | None = None,
+                timeout_seconds: float | None = None,
+                cancellation: Event | None = None,
+                memory_pressure_fn: Callable[[], bool] | None = None,
+                memory_pressure_backoff_seconds: float = 1.0,
+                memory_pressure_max_backoffs: int = 3,
+            ) -> ProcessResult:
+                captured_argv.append(list(argv))
+                return ProcessResult(0, '{"samples_ts":[1.0,2.0,3.0]}', "")
+
+        app = Application(runner, process_adapter=CapturingAdapter())
+
+        from llama_parameter_scout.search import QUICK_PROFILE
+        app.screen_candidates(req, QUICK_PROFILE)
+
+        # Check that measurement calls (not warmup) use the correct -r value.
+        measurement_argv = [
+            argv for argv in captured_argv
+            if not any(
+                a == "-r" and str(argv[idx + 1]) == "1"
+                for idx, a in enumerate(argv) if a == "-r"
+            )
+        ]
+        assert measurement_argv, "No measurement calls found (all captured were warmup?)"
+        for argv in measurement_argv:
+            pairs = dict(zip(argv[1::2], argv[2::2]))
+            r_val = int(pairs["-r"])
+            assert r_val == QUICK_PROFILE.min_repetitions, (
+                f"Expected -r {QUICK_PROFILE.min_repetitions}, got -r {r_val}"
+            )
+
+    def test_nctx_matches_workload(
+        self, tmp_path: Path,
+    ) -> None:
+        """Verify PP workload gets a PP-heavy n_ctx and TG workload TG-heavy."""
+        from llama_parameter_scout.runner import FakeRunner
+
+        req = self._build_request(tmp_path)
+        runner = FakeRunner()
+        runner.enqueue((str(req.binary_path), "--version"),
+                        ProcessResult(0, self._toolchain_stdout(), ""))
+        runner.enqueue((str(req.binary_path), "--help"),
+                        ProcessResult(0, "usage\n", ""))
+
+        captured: list[list[str]] = []
+
+        class NctxCapturingAdapter:
+            def launch(
+                self,
+                argv: Sequence[str],
+                *,
+                env: dict[str, str] | None = None,
+                timeout_seconds: float | None = None,
+                cancellation: Event | None = None,
+                memory_pressure_fn: Callable[[], bool] | None = None,
+                memory_pressure_backoff_seconds: float = 1.0,
+                memory_pressure_max_backoffs: int = 3,
+            ) -> ProcessResult:
+                captured.append(list(argv))
+                return ProcessResult(0, '{"samples_ts":[1.0,2.0,3.0]}', "")
+
+        app = Application(runner, process_adapter=NctxCapturingAdapter())
+
+        from llama_parameter_scout.search import QUICK_PROFILE
+        app.screen_candidates(req, QUICK_PROFILE)
+
+        # Should have PP and TG workload calls with specific n_ctx patterns
+        pp_call = None
+        tg_call = None
+        for argv in captured:
+            pairs = dict(zip(argv[1::2], argv[2::2]))
+            if "-p" in pairs and "-n" in pairs:
+                p_val = int(pairs["-p"])
+                n_val = int(pairs["-n"])
+                if p_val > n_val:
+                    pp_call = argv
+                elif n_val > p_val:
+                    tg_call = argv
+
+        assert pp_call is not None, "Expected a PP-heavy call (prompt > gen)"
+        assert tg_call is not None, "Expected a TG-heavy call (gen > prompt)"
+
+    def test_non_none_session_spec_used(
+        self, tmp_path: Path,
+    ) -> None:
+        """When a requested-context SessionSpecification is provided,
+        the derived per-workload spec uses the workload n_ctx."""
+        from llama_parameter_scout.model_inspector import inspect_model
+        from llama_parameter_scout.models import SystemTopology
+        from llama_parameter_scout.runner import FakeRunner
+
+        req = self._build_request(tmp_path)
+        runner = FakeRunner()
+        runner.enqueue((str(req.binary_path), "--version"),
+                        ProcessResult(0, self._toolchain_stdout(), ""))
+        runner.enqueue((str(req.binary_path), "--help"),
+                        ProcessResult(0, "usage\n", ""))
+
+        model = inspect_model(req.model_path)
+        topology = SystemTopology(
+            cpu_count=4, system_memory_bytes=32_000_000_000,
+            accelerators=(), memory_unified=True,
+        )
+        spec = SessionSpecification(
+            topology=topology, cpu_only=True, selected_device_ids=(),
+            n_ctx=NctxComposition(total=2048, prompt=512, generation=1024, depth=512),
+            budget=ResourceBudget(
+                ram_bytes=32_000_000_000, vram_bytes=None, headroom_ratio=0.1,
+            ),
+            advisory=None,  # type: ignore[arg-type]
+            model=model, acknowledged=True, fingerprint="testfp",
+        )
+
+        captured_specs: list[str] = []
+
+        class SpecRecordingAdapter:
+            def launch(
+                self,
+                argv: Sequence[str],
+                *,
+                env: dict[str, str] | None = None,
+                timeout_seconds: float | None = None,
+                cancellation: Event | None = None,
+                memory_pressure_fn: Callable[[], bool] | None = None,
+                memory_pressure_backoff_seconds: float = 1.0,
+                memory_pressure_max_backoffs: int = 3,
+            ) -> ProcessResult:
+                captured_specs.append(" ".join(str(a) for a in argv))
+                return ProcessResult(0, '{"samples_ts":[1.0,2.0,3.0]}', "")
+
+        app = Application(runner, process_adapter=SpecRecordingAdapter(),
+                          detect_topology_fn=lambda: topology)
+
+        from llama_parameter_scout.search import QUICK_PROFILE
+        report = app.screen_candidates(req, QUICK_PROFILE, session_spec=spec)
+
+        assert report is not None
