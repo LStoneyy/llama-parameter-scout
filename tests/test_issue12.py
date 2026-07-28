@@ -540,26 +540,28 @@ class TestBuildServerCommandDraftFlags:
 
 
 class TestBuildPresetDraftKeys:
+    MODEL_PATH = "/main.gguf"
+
     def test_preset_includes_draft_keys(self) -> None:
         from llama_parameter_scout.reporter import build_preset_ini_section
 
         preset = build_preset_ini_section(
-            _candidate(), _ctx2048(),
+            _candidate(), _ctx2048(), self.MODEL_PATH,
             draft_model_path="/draft.gguf",
             draft_settings=MtpDraftSettings(n_gpu_layers_draft=0, draft_max=16),
         )
-        assert "model_draft = /draft.gguf" in preset
-        assert "n_gpu_layers_draft = 0" in preset
-        assert "draft_max = 16" in preset
+        assert "model-draft = /draft.gguf" in preset
+        assert "n-gpu-layers-draft = 0" in preset
+        assert "spec-draft-n-max = 16" in preset
 
     def test_preset_omitted_when_not_provided(self) -> None:
         from llama_parameter_scout.reporter import build_preset_ini_section
 
         preset = build_preset_ini_section(
-            _candidate(), _ctx2048(),
+            _candidate(), _ctx2048(), self.MODEL_PATH,
         )
-        assert "model_draft" not in preset
-        assert "n_gpu_layers_draft" not in preset
+        assert "model-draft" not in preset
+        assert "n-gpu-layers-draft" not in preset
 
 
 # ── Reporter: JSON MTP profile section ──────────────────────────
@@ -942,9 +944,9 @@ class TestMtpPresetRendering:
         )
 
         assert "Preset.ini (MTP recommendation)" in md
-        assert "model_draft = /draft.gguf" in md
-        assert "n_gpu_layers_draft = 0" in md
-        assert "draft_max = 16" in md
+        assert "model-draft = /draft.gguf" in md
+        assert "n-gpu-layers-draft = 0" in md
+        assert "spec-draft-n-max = 16" in md
 
     def test_json_mtp_preset_includes_draft_keys(self) -> None:
         import json

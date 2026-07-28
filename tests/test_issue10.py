@@ -679,41 +679,76 @@ class TestProductionCommands:
         assert "-ctk" not in cmd  # cache_type_k=f16 is the default, omitted
 
 
+class TestProductionCommandsMmproj:
+    def test_llama_cli_no_mmproj_by_default(self, sample_candidate: CandidateConfig,
+                                              sample_nctx: NctxComposition) -> None:
+        cmd = build_llama_cli_command(sample_candidate, sample_nctx, "/path/model.gguf")
+        assert "--mmproj" not in cmd
+
+    def test_llama_server_no_mmproj_by_default(self, sample_candidate: CandidateConfig,
+                                                sample_nctx: NctxComposition) -> None:
+        cmd = build_llama_server_command(sample_candidate, sample_nctx, "/path/model.gguf")
+        assert "--mmproj" not in cmd
+
+    def test_llama_cli_with_mmproj(self, sample_candidate: CandidateConfig,
+                                    sample_nctx: NctxComposition) -> None:
+        cmd = build_llama_cli_command(
+            sample_candidate, sample_nctx, "/path/model.gguf",
+            mmproj_path="/path/mmproj.gguf",
+        )
+        assert "--mmproj" in cmd
+        idx = cmd.index("--mmproj")
+        assert cmd[idx + 1] == "/path/mmproj.gguf"
+
+    def test_llama_server_with_mmproj(self, sample_candidate: CandidateConfig,
+                                       sample_nctx: NctxComposition) -> None:
+        cmd = build_llama_server_command(
+            sample_candidate, sample_nctx, "/path/model.gguf",
+            mmproj_path="/path/mmproj.gguf",
+        )
+        assert "--mmproj" in cmd
+        idx = cmd.index("--mmproj")
+        assert cmd[idx + 1] == "/path/mmproj.gguf"
+
+
 # ── Cycle 6: preset.ini ──────────────────────────────────────────
 
 
 class TestPresetIni:
+    MODEL_PATH = "/home/user/models/model.gguf"
+
     def test_preset_ini_section_has_required_keys(
         self, sample_candidate: CandidateConfig, sample_nctx: NctxComposition,
     ) -> None:
-        ini = build_preset_ini_section(sample_candidate, sample_nctx)
-        assert ini.startswith("[llama]")
-        assert "n_ctx" in ini
-        assert "n_batch" in ini
-        assert "n_ubatch" in ini
-        assert "n_threads" in ini
-        assert "n_gpu_layers" in ini
-        assert "flash_attn" in ini
-        assert "cache_type_k" in ini
-        assert "cache_type_v" in ini
+        ini = build_preset_ini_section(sample_candidate, sample_nctx, self.MODEL_PATH)
+        assert ini.startswith("[model]")
+        assert "model = /home/user/models/model.gguf" in ini
+        assert "ctx-size" in ini
+        assert "batch-size" in ini
+        assert "ubatch-size" in ini
+        assert "threads" in ini
+        assert "n-gpu-layers" in ini
+        assert "flash-attn" in ini
+        assert "cache-type-k" in ini
+        assert "cache-type-v" in ini
 
     def test_preset_ini_values(self, sample_candidate: CandidateConfig,
                                 sample_nctx: NctxComposition) -> None:
-        ini = build_preset_ini_section(sample_candidate, sample_nctx)
-        assert f"n_ctx = {sample_nctx.total}" in ini
-        assert f"n_batch = {sample_candidate.batch_size}" in ini
-        assert "flash_attn = false" in ini
+        ini = build_preset_ini_section(sample_candidate, sample_nctx, self.MODEL_PATH)
+        assert f"ctx-size = {sample_nctx.total}" in ini
+        assert f"batch-size = {sample_candidate.batch_size}" in ini
+        assert "flash-attn = false" in ini
 
     def test_preset_ini_flash_attn_true(self, sample_candidate_fa: CandidateConfig,
-                                         sample_nctx: NctxComposition) -> None:
-        ini = build_preset_ini_section(sample_candidate_fa, sample_nctx)
-        assert "flash_attn = true" in ini
+                                          sample_nctx: NctxComposition) -> None:
+        ini = build_preset_ini_section(sample_candidate_fa, sample_nctx, self.MODEL_PATH)
+        assert "flash-attn = true" in ini
 
     def test_preset_ini_quantized_cache(self, sample_candidate_fa: CandidateConfig,
-                                         sample_nctx: NctxComposition) -> None:
-        ini = build_preset_ini_section(sample_candidate_fa, sample_nctx)
-        assert "cache_type_k = f16" in ini
-        assert "cache_type_v = q8_0" in ini
+                                          sample_nctx: NctxComposition) -> None:
+        ini = build_preset_ini_section(sample_candidate_fa, sample_nctx, self.MODEL_PATH)
+        assert "cache-type-k = f16" in ini
+        assert "cache-type-v = q8_0" in ini
 
     def test_preset_ini_moe(self, sample_nctx: NctxComposition) -> None:
         c = CandidateConfig(
@@ -722,25 +757,40 @@ class TestPresetIni:
             cache_type_k="f16", cache_type_v="f16",
             n_cpu_moe=1,
         )
-        ini = build_preset_ini_section(c, sample_nctx)
-        assert "n_cpu_moe = 1" in ini
+        ini = build_preset_ini_section(c, sample_nctx, self.MODEL_PATH)
+        assert "n-cpu-moe = 1" in ini
 
     def test_preset_ini_valid_format(self, sample_candidate: CandidateConfig,
-                                      sample_nctx: NctxComposition) -> None:
-        ini = build_preset_ini_section(sample_candidate, sample_nctx)
+                                       sample_nctx: NctxComposition) -> None:
+        ini = build_preset_ini_section(sample_candidate, sample_nctx, self.MODEL_PATH)
         lines = ini.strip().split("\n")
-        assert lines[0] == "[llama]"
+        assert lines[0] == "[model]"
         for line in lines[1:]:
             if line.strip():
                 assert "=" in line, f"Invalid ini line: {line}"
 
     def test_preset_ini_device_selected(self, sample_candidate: CandidateConfig,
-                                         sample_nctx: NctxComposition) -> None:
+                                           sample_nctx: NctxComposition) -> None:
         ini = build_preset_ini_section(
-            sample_candidate, sample_nctx,
+            sample_candidate, sample_nctx, self.MODEL_PATH,
             cpu_only=False, selected_device_ids=(0,),
         )
-        assert "main_gpu = 0" in ini
+        assert "main-gpu = 0" in ini
+
+    def test_preset_ini_mmproj_present_when_provided(
+        self, sample_candidate: CandidateConfig, sample_nctx: NctxComposition,
+    ) -> None:
+        ini = build_preset_ini_section(
+            sample_candidate, sample_nctx, self.MODEL_PATH,
+            mmproj_path="/path/mmproj.gguf",
+        )
+        assert "mmproj = /path/mmproj.gguf" in ini
+
+    def test_preset_ini_mmproj_omitted_when_none(
+        self, sample_candidate: CandidateConfig, sample_nctx: NctxComposition,
+    ) -> None:
+        ini = build_preset_ini_section(sample_candidate, sample_nctx, self.MODEL_PATH)
+        assert "mmproj" not in ini
 
     def test_preset_ini_present_in_json(
         self, sample_session: SessionSpecification,
@@ -754,7 +804,7 @@ class TestPresetIni:
         )
         data = json.loads(raw)
         cmds = data["reproduction_commands"]
-        assert cmds["preset_ini"].startswith("[llama]")
+        assert cmds["preset_ini"].startswith("[model]")
 
 
 # ── Cycle 7: Markdown report ─────────────────────────────────────
@@ -1002,12 +1052,12 @@ class TestH3LeaderPresetIni:
             screening_report=sample_screening_report,
         )
         # leader is sample_candidate_fa (flash_attn=True, cache_type_v=q8_0)
-        assert "flash_attn = true" in md
-        assert "cache_type_v = q8_0" in md
+        assert "flash-attn = true" in md
+        assert "cache-type-v = q8_0" in md
         # first survivor is sample_candidate (flash_attn=False, cache_type_v=f16)
-        has_false = "flash_attn = false" in md
+        has_false = "flash-attn = false" in md
         if has_false:
-            assert md.index("flash_attn = true") < md.index("flash_attn = false")
+            assert md.index("flash-attn = true") < md.index("flash-attn = false")
 
 
 class TestH4MoeArgv:
@@ -1190,8 +1240,8 @@ class TestRegressionPresetFromValidation:
             validation_result=validation,
         )
         assert "Preset.ini" in md
-        assert "flash_attn = true" in md
-        assert "cache_type_v = q8_0" in md
+        assert "flash-attn = true" in md
+        assert "cache-type-v = q8_0" in md
 
     def test_json_preset_from_validation_without_screening(
         self, sample_session: SessionSpecification,
@@ -1217,7 +1267,7 @@ class TestRegressionPresetFromValidation:
         data = json.loads(raw)
         cmds = data["reproduction_commands"]
         assert "preset_ini" in cmds
-        assert cmds["preset_ini"].startswith("[llama]")
+        assert cmds["preset_ini"].startswith("[model]")
 
     def test_preset_ini_no_winner_no_screening_omitted(
         self, sample_session: SessionSpecification,
@@ -1626,3 +1676,135 @@ class TestReproductionArgvExact:
             f"Got {len(ra)}: {[e['candidate'] for e in ra]}"
         )
         assert ra[0]["candidate"]["threads"] == 4, "Only c1 (threads=4) should appear"
+
+
+# ── Mmproj through JSON/Markdown export ──────────────────────────
+
+
+class TestMmprojInJsonExport:
+    def test_json_includes_mmproj_in_commands_and_preset(
+        self, sample_session: SessionSpecification,
+        sample_toolchain: ToolchainFingerprint,
+        sample_model: ModelFingerprint,
+        sample_screening_report: ScreeningReport,
+    ) -> None:
+        raw = render_export_json(
+            session=sample_session, toolchain=sample_toolchain, model=sample_model,
+            screening_report=sample_screening_report,
+            mmproj_path="/opt/mmproj/mmproj.gguf",
+        )
+        data = json.loads(raw)
+        cmds = data["reproduction_commands"]
+        cli = cmds["llama_cli"]
+        assert "--mmproj" in cli
+        idx = cli.index("--mmproj")
+        assert cli[idx + 1] == "/opt/mmproj/mmproj.gguf"
+        srv = cmds["llama_server"]
+        assert "--mmproj" in srv
+        idx2 = srv.index("--mmproj")
+        assert srv[idx2 + 1] == "/opt/mmproj/mmproj.gguf"
+        preset = cmds["preset_ini"]
+        assert "mmproj = /opt/mmproj/mmproj.gguf" in preset
+
+    def test_json_omits_mmproj_when_not_supplied(
+        self, sample_session: SessionSpecification,
+        sample_toolchain: ToolchainFingerprint,
+        sample_model: ModelFingerprint,
+        sample_screening_report: ScreeningReport,
+    ) -> None:
+        raw = render_export_json(
+            session=sample_session, toolchain=sample_toolchain, model=sample_model,
+            screening_report=sample_screening_report,
+        )
+        data = json.loads(raw)
+        cmds = data["reproduction_commands"]
+        assert "--mmproj" not in cmds["llama_cli"]
+        assert "--mmproj" not in cmds["llama_server"]
+        assert "mmproj" not in cmds["preset_ini"]
+
+    def test_json_without_mmproj_matches_default(
+        self, sample_session: SessionSpecification,
+        sample_toolchain: ToolchainFingerprint,
+        sample_model: ModelFingerprint,
+        sample_screening_report: ScreeningReport,
+    ) -> None:
+        default_raw = render_export_json(
+            session=sample_session, toolchain=sample_toolchain, model=sample_model,
+            screening_report=sample_screening_report,
+        )
+        explicit_none_raw = render_export_json(
+            session=sample_session, toolchain=sample_toolchain, model=sample_model,
+            screening_report=sample_screening_report,
+            mmproj_path=None,
+        )
+        default = json.loads(default_raw)
+        explicit = json.loads(explicit_none_raw)
+        default.pop("exported_at")
+        explicit.pop("exported_at")
+        assert default == explicit
+
+
+class TestMmprojInMarkdownExport:
+    def test_markdown_includes_redacted_mmproj(
+        self, sample_session: SessionSpecification,
+        sample_toolchain: ToolchainFingerprint,
+        sample_model: ModelFingerprint,
+        sample_screening_report: ScreeningReport,
+    ) -> None:
+        home = str(Path.home())
+        md = render_export_markdown(
+            session=sample_session, toolchain=sample_toolchain, model=sample_model,
+            screening_report=sample_screening_report,
+            mmproj_path=f"{home}/mmproj/mmproj.gguf",
+        )
+        assert "[HOME]" in md
+        assert "--mmproj" in md
+        assert "[HOME]/mmproj/mmproj.gguf" in md
+        assert home + "/mmproj/mmproj.gguf" not in md.replace("[HOME]", "")
+
+    def test_markdown_mmproj_in_preset(
+        self, sample_session: SessionSpecification,
+        sample_toolchain: ToolchainFingerprint,
+        sample_model: ModelFingerprint,
+        sample_screening_report: ScreeningReport,
+    ) -> None:
+        md = render_export_markdown(
+            session=sample_session, toolchain=sample_toolchain, model=sample_model,
+            screening_report=sample_screening_report,
+            mmproj_path="/opt/mmproj.gguf",
+        )
+        assert "mmproj = /opt/mmproj.gguf" in md
+
+    def test_markdown_omits_mmproj_when_not_supplied(
+        self, sample_session: SessionSpecification,
+        sample_toolchain: ToolchainFingerprint,
+        sample_model: ModelFingerprint,
+        sample_screening_report: ScreeningReport,
+    ) -> None:
+        md = render_export_markdown(
+            session=sample_session, toolchain=sample_toolchain, model=sample_model,
+            screening_report=sample_screening_report,
+        )
+        assert "mmproj" not in md
+
+    def test_markdown_without_mmproj_matches_default(
+        self, sample_session: SessionSpecification,
+        sample_toolchain: ToolchainFingerprint,
+        sample_model: ModelFingerprint,
+        sample_screening_report: ScreeningReport,
+    ) -> None:
+        default_md = render_export_markdown(
+            session=sample_session, toolchain=sample_toolchain, model=sample_model,
+            screening_report=sample_screening_report,
+        )
+        explicit_none_md = render_export_markdown(
+            session=sample_session, toolchain=sample_toolchain, model=sample_model,
+            screening_report=sample_screening_report,
+            mmproj_path=None,
+        )
+        def _without_timestamp(md: str) -> str:
+            return "\n".join(
+                line for line in md.splitlines()
+                if not line.startswith("**Exported at:")
+            )
+        assert _without_timestamp(default_md) == _without_timestamp(explicit_none_md)

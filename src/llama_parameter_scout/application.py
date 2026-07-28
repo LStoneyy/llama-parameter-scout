@@ -167,9 +167,9 @@ def _env_for_device(spec: SessionSpecification) -> dict[str, str] | None:
     return None
 
 
-def _cache_element_size(cache_type: str) -> int:
-    mapping = {"f16": 2, "f32": 4, "q8_0": 1, "q4_0": 1}
-    return mapping.get(cache_type, 2)
+def _cache_element_size(cache_type: str) -> float:
+    mapping = {"f16": 2.0, "f32": 4.0, "q8_0": 1.0625, "q4_0": 0.5625}
+    return mapping.get(cache_type, 2.0)
 
 
 def _build_argv(
@@ -490,12 +490,15 @@ def _estimate_advisory(
     model: ModelFingerprint,
     n_ctx: NctxComposition,
     budget: ResourceBudget,
-    cache_type: str = "f16",
+    cache_type_k: str = "f16",
+    cache_type_v: str = "f16",
 ) -> ContextAdvisory:
     model_weight = _compute_model_weight_bytes(model)
-    element_size = _cache_element_size(cache_type)
+    ek = _cache_element_size(cache_type_k)
+    ev = _cache_element_size(cache_type_v)
+    avg_element = (ek + ev) / 2.0
     param_count = model.parameter_count or 7_000_000_000
-    bytes_per_token = int(param_count * _ESTIMATED_BYTES_PER_TOKEN_PER_PARAM * element_size // 2)
+    bytes_per_token = int(param_count * _ESTIMATED_BYTES_PER_TOKEN_PER_PARAM * avg_element / 2.0)
     kv_cache_bytes_estimate = bytes_per_token * n_ctx.total
 
     ram_after_headroom = int(budget.ram_bytes * (1 - budget.headroom_ratio))
@@ -897,13 +900,18 @@ def _launch_and_classify(
 def _build_workload_session_spec(
     base_spec: SessionSpecification,
     workload_nctx: NctxComposition,
+    candidate: CandidateConfig | None = None,
 ) -> SessionSpecification:
     budget = ResourceBudget(
         ram_bytes=base_spec.budget.ram_bytes,
         vram_bytes=base_spec.budget.vram_bytes,
         headroom_ratio=base_spec.budget.headroom_ratio,
     )
-    advisory = _estimate_advisory(base_spec.model, workload_nctx, budget)
+    advisory = _estimate_advisory(
+        base_spec.model, workload_nctx, budget,
+        cache_type_k=candidate.cache_type_k if candidate else "f16",
+        cache_type_v=candidate.cache_type_v if candidate else "f16",
+    )
     spec = SessionSpecification(
         topology=base_spec.topology,
         cpu_only=base_spec.cpu_only,
@@ -1082,7 +1090,9 @@ def _run_screening_workload(
 
     workload_spec: SessionSpecification | None = None
     if base_session_spec is not None:
-        workload_spec = _build_workload_session_spec(base_session_spec, workload_nctx)
+        workload_spec = _build_workload_session_spec(
+            base_session_spec, workload_nctx, candidate=candidate,
+        )
 
     preflight = _screening_preflight(wr, toolchain, model, workload_spec)
     if preflight is not None:
@@ -1223,7 +1233,11 @@ class Application:
 
         _check_context_acknowledgement(model, n_ctx, acknowledged)
 
-        advisory = _estimate_advisory(model, n_ctx, budget, candidate.cache_type_k)
+        advisory = _estimate_advisory(
+            model, n_ctx, budget,
+            cache_type_k=candidate.cache_type_k,
+            cache_type_v=candidate.cache_type_v,
+        )
 
         spec = SessionSpecification(
             topology=topology,
@@ -2282,6 +2296,7 @@ class Application:
         mtp_profile: MtpProfileReport | None = None,
         provenance: LaunchProvenance | None = None,
         include_hashes: bool = False,
+        mmproj_path: str | None = None,
     ) -> str:
         from .reporter import render_export_json as _render
 
@@ -2294,6 +2309,7 @@ class Application:
             mtp_profile=mtp_profile,
             provenance=provenance,
             include_hashes=include_hashes,
+            mmproj_path=mmproj_path,
         )
 
     def export_report_markdown(
@@ -2307,6 +2323,7 @@ class Application:
         mtp_profile: MtpProfileReport | None = None,
         provenance: LaunchProvenance | None = None,
         include_hashes: bool = False,
+        mmproj_path: str | None = None,
     ) -> str:
         from .reporter import render_export_markdown as _render
 
@@ -2319,6 +2336,7 @@ class Application:
             mtp_profile=mtp_profile,
             provenance=provenance,
             include_hashes=include_hashes,
+            mmproj_path=mmproj_path,
         )
 
 
@@ -2329,7 +2347,6 @@ def _check_resource_budget(
     session_spec: SessionSpecification,
     n_ctx: NctxComposition,
     candidate: CandidateConfig,
-    cache_type_k: str = "f16",
 ) -> CandidateOutcome | None:
     budget = session_spec.budget
     headroom = budget.headroom_ratio
@@ -2342,8 +2359,10 @@ def _check_resource_budget(
         model_weight = model.path.stat().st_size
 
     param_count = model.parameter_count or 7_000_000_000
-    element_size = _cache_element_size(cache_type_k)
-    bytes_per_token = int(param_count * _ESTIMATED_BYTES_PER_TOKEN_PER_PARAM * element_size // 2)
+    ek = _cache_element_size(candidate.cache_type_k)
+    ev = _cache_element_size(candidate.cache_type_v)
+    avg_element = (ek + ev) / 2.0
+    bytes_per_token = int(param_count * _ESTIMATED_BYTES_PER_TOKEN_PER_PARAM * avg_element / 2.0)
     kv_estimate = bytes_per_token * n_ctx.total
 
     ram_available = int(budget.ram_bytes * (1 - headroom))
@@ -2405,7 +2424,6 @@ def pre_execution_disposition(
 
     budget_outcome = _check_resource_budget(
         session_spec, request.n_ctx, request.candidate,
-        cache_type_k=request.candidate.cache_type_k,
     )
     if budget_outcome is not None:
         assert budget_outcome.candidate == request.candidate
