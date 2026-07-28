@@ -10,6 +10,7 @@ from llama_parameter_scout.toolchain import (
     _parse_backends,
     _parse_output_formats,
     _parse_supported_flags,
+    _parse_supported_flags_from_help,
     _parse_version,
     inspect_toolchain,
     resolve_binary,
@@ -372,3 +373,134 @@ class TestParseSupportedFlags:
     def test_missing_raises(self) -> None:
         with pytest.raises(ToolchainError, match="supported_flags:' line"):
             _parse_supported_flags("version: 1234\n")
+
+
+class TestUpstreamFallback:
+    def test_bench_version_unrecognized_falls_back(self) -> None:
+        runner = FakeRunner()
+        bp = Path("/usr/local/bin/llama-bench")
+
+        runner.enqueue(
+            (str(bp), "--version"),
+            ProcessResult(
+                returncode=1,
+                stdout="usage: llama-bench [options]\n",
+                stderr=(
+                    "ggml_metal_init: found Metal device: Apple M2 Pro\n"
+                    "error: invalid parameter for argument: --version\n"
+                ),
+            ),
+        )
+        runner.enqueue(
+            (str(bp.parent / "llama-cli"), "--version"),
+            ProcessResult(
+                returncode=0,
+                stdout="",
+                stderr=(
+                    "version: 10162 (6ba5ef247)\n"
+                    "built with Apple Clang 16.0.0 (clang-1600.0.26.6)\n"
+                ),
+            ),
+        )
+        help_stdout = (
+            "usage: llama-bench [options]\n\n"
+            "options:\n"
+            "  -h, --help                        show this help message and exit\n"
+            "  -m, --model <FNAME>               model path\n"
+            "  -p, --n-prompt <NPROMPT>          number of prompt tokens (default: 512)\n"
+            "  -n, --n-gen <NGEN>                number of tokens to generate (default: 128)\n"
+            "  -d, --n-gpu-layers <NGL>          number of layers to offload to GPU\n"
+            "  -t, --threads <N>                 number of threads to use\n"
+            "  -b, --batch-size <N>              batch size for prompt processing\n"
+            "  -ub, --ubatch-size <N>            physical batch size\n"
+            "  -ngl, --n-gpu-layers <NGL>        number of layers to offload to GPU\n"
+            "  -fa, --flash-attn                 enable flash attention\n"
+            "  -ctk, --cache-type-k <TYPE>       cache type for K (default: f16)\n"
+            "  -ctv, --cache-type-v <TYPE>       cache type for V (default: f16)\n"
+            "  -o, --output <csv|json|jsonl|md|sql>\n"
+            "  -r, --repetitions <N>             number of repetitions\n"
+            "  --no-warmup                       skip warmup\n"
+        )
+        help_stderr = (
+            "ggml_metal_init: found Metal device: Apple M2 Pro\n"
+            "ggml_metal_init: picking default device: M2 Pro\n"
+        )
+        runner.enqueue(
+            (str(bp), "--help"),
+            ProcessResult(returncode=0, stdout=help_stdout, stderr=help_stderr),
+        )
+
+        fp = inspect_toolchain(runner, bp)
+        assert fp.version == "10162"
+        assert "-m" in fp.supported_flags
+        assert "--model" in fp.supported_flags
+        assert "-o" in fp.supported_flags
+        assert "--output" in fp.supported_flags
+        assert "csv" in fp.supported_output_formats
+        assert "json" in fp.supported_output_formats
+        assert "jsonl" in fp.supported_output_formats
+        assert "md" in fp.supported_output_formats
+        assert "sql" in fp.supported_output_formats
+        assert fp.device_capabilities == ("cpu", "metal")
+
+    def test_arbitrary_crash_still_raises(self) -> None:
+        runner = FakeRunner()
+        bp = Path("/usr/local/bin/llama-bench")
+        runner.enqueue(
+            (str(bp), "--version"),
+            ProcessResult(returncode=1, stdout="", stderr="Segmentation fault"),
+        )
+        with pytest.raises(ToolchainError, match="exited with code 1"):
+            inspect_toolchain(runner, bp)
+
+    def test_fallback_cli_fails_raises(self) -> None:
+        runner = FakeRunner()
+        bp = Path("/usr/local/bin/llama-bench")
+        runner.enqueue(
+            (str(bp), "--version"),
+            ProcessResult(
+                returncode=1,
+                stdout="",
+                stderr="error: invalid parameter for argument: --version\n",
+            ),
+        )
+        runner.enqueue(
+            (str(bp.parent / "llama-cli"), "--version"),
+            ProcessResult(returncode=127, stdout="", stderr="cli not found"),
+        )
+        with pytest.raises(ToolchainError, match="fallback"):
+            inspect_toolchain(runner, bp)
+
+    def test_fallback_malformed_cli_version_raises(self) -> None:
+        runner = FakeRunner()
+        bp = Path("/usr/local/bin/llama-bench")
+        runner.enqueue(
+            (str(bp), "--version"),
+            ProcessResult(
+                returncode=1,
+                stdout="",
+                stderr="error: invalid parameter for argument: --version\n",
+            ),
+        )
+        runner.enqueue(
+            (str(bp.parent / "llama-cli"), "--version"),
+            ProcessResult(returncode=0, stdout="", stderr="no version line\n"),
+        )
+        runner.enqueue(
+            (str(bp), "--help"),
+            ProcessResult(returncode=0, stdout="usage: llama-bench\n", stderr=""),
+        )
+        with pytest.raises(ToolchainError, match="llama-cli --version"):
+            inspect_toolchain(runner, bp)
+
+    def test_help_parser_no_placeholders(self) -> None:
+        help_stdout = (
+            "options:\n"
+            "  -m, --model <FNAME>    model path\n"
+            "  -ctk, --cache-type-k <TYPE>  cache type\n"
+        )
+        flags = _parse_supported_flags_from_help(help_stdout)
+        assert "-m" in flags
+        assert "--model" in flags
+        assert "<FNAME>" not in flags
+        assert "<TYPE>" not in flags

@@ -67,7 +67,7 @@ The TUI provides a four-screen workflow that guides you through session setup, r
 
 ### Workflow
 
-1. **Wizard** — fill in the llama-bench path, model path, journal path, optional MTP draft/server paths, device selection, context composition, search profile and objective, and resource budget overrides. Use Tab/Shift+Tab to navigate, Enable MTP checkbox to reveal draft/server inputs. A visible **Quit (Ctrl+Q)** button exits immediately.
+1. **Wizard** — fill in the llama-bench path, model path, journal path, optional MTP draft/server paths, device selection, context composition, search profile and objective, and resource budget overrides. Browse buttons next to the llama-bench, model, journal, and draft model inputs open modal file browsers (llama-server has no browse). The device dropdown is populated at startup, defaults to CPU-only, and shows each accelerator's name, ID, and backend. The context dropdown offers presets (2048/4096/8192/16384/32768) plus custom values. Use Tab/Shift+Tab to navigate, Enable MTP checkbox to reveal draft/server inputs. A visible **Quit (Ctrl+Q)** button exits immediately.
 2. **Review** — review the complete session specification before starting. Press F10 or click Start to begin. A visible **Quit (Ctrl+Q)** button exits immediately.
 3. **Progress** — live progress shows the current stage (setup, screening, validation, mtp_profile), candidate evaluations, dispositions, errors, and warnings. Press Esc or Ctrl+C to cancel, or press Ctrl+Q / click **Quit (Ctrl+Q)** to cancel the benchmark and close.
 4. **Results** — read-only tabs for Markdown report, preset.ini, and shell commands. Uses existing `Application.export_report_markdown` and reporter builders. Click **Quit (Esc)** to close.
@@ -104,6 +104,30 @@ from the CLI to inspect journaled sessions.
 
 The wizard and results screens use scrollable containers and reflow to stay navigable
 in terminals as narrow as 40 columns.
+
+### File browsers
+
+Browse buttons appear next to the llama-bench, model, journal, and draft model inputs (not llama-server). Each opens a modal browser rooted at the user's home directory:
+
+- **Model and draft browsers** filter to `.gguf` files only.
+- **Journal browser** filters to `.json` files only.
+- **llama-bench browser** shows all regular files.
+
+Manual input remains editable after a browse selection. A nonexistent journal path can still be typed directly.
+
+### Device detection
+
+On screen mount, device topology is detected asynchronously. A status label shows "Detecting..." then the result:
+
+- **Accelerators found:** `N accelerator(s) detected`.
+- **No accelerators:** `No accelerators detected`.
+- **Detection failure:** `Detection: <reason>`.
+
+The device dropdown is populated with a `CPU-only` default and one entry per detected accelerator using the format `description (id=N, backend)`. CPU-only remains the default even when accelerators exist.
+
+### Context presets
+
+A context preset dropdown offers 2048, 4096, 8192, 16384, and 32768 tokens plus a `custom` option. Selecting a preset populates the four fields: prompt = 25% of total, generation = 50%, depth = remaining 25%. Selecting `custom` reveals the four individual inputs. On session restore, values matching a preset re-select it; otherwise the dropdown switches to `custom`.
 
 ## Single-run CLI
 
@@ -182,7 +206,7 @@ Default budgets use the detected system memory (and zero VRAM for discrete GPUs)
 ### What happens
 
 1. **Binary resolution:** the executable is located via the precedence chain above.
-2. **Toolchain fingerprint:** `llama-bench --version` is parsed for version, supported flags, device backends, and supported output formats. `--help` is verified to confirm the binary is responsive.
+2. **Toolchain fingerprint:** `llama-bench --version` is parsed for version, supported flags, device backends, and supported output formats. The legacy metadata path remains the primary source. If `--version` exits with an explicit unrecognized/unsupported option diagnostic, `llama-cli --version` in the same directory is used as a version fallback; flags, formats, and backends are then derived from combined `--help` output. `--help` is always validated to confirm the binary is responsive.
 3. **Model inspection:** the GGUF file header is read to extract architecture, parameter count, training context, and quantization type. Split shard sets (e.g. `model-00001-of-00003.gguf`) are resolved and fingerprinted with path, size, mtime, and SHA-256 digest. Symlinks and network mounts produce warnings. Remote URLs, mmproj files, and LoRA adapters (by extension or GGUF metadata) are rejected.
 4. **Session setup:** system topology is detected (CPU count, system memory, accelerator count and type, unified vs discrete memory). Device selection is validated, a resource budget is built, and a context advisory is estimated. The full specification is printed and requires confirmation (unless `--yes`).
 5. **Preflight validation:** binary must exist and be executable; model must exist; n_ctx must be > 0, components nonnegative and sum exactly to total; candidate values must be in range.
@@ -291,9 +315,10 @@ All profiles use a screening context of `NctxComposition(total=512, prompt=128, 
 
 Capabilities are detected deterministically from the `llama-bench` binary:
 
-- **Supported flags**: parsed from the `supported_flags:` line in `--version` output.
+- **Supported flags**: parsed from the `supported_flags:` line in `--version` output. When falling back from an unrecognized `--version`, option aliases are parsed from `--help` output (e.g. `-m`, `--model`, `--no-warmup`).
 - **Supported cache types**: parsed from `-ctk`/`-ctv` flag help in `--help` output (e.g. `{f16,f32,q8_0,q4_0}`). If not enumerated, a conservative minimum of `("f16",)` is used.
-- **Device backends**: parsed from the `backends:` line in `--version` output.
+- **Supported output formats**: parsed from the `supported_output_formats:` line in `--version` output. When falling back, formats are parsed from the `--output <csv|json|jsonl|md|sql>` help text.
+- **Device backends**: parsed from the `backends:` line in `--version` output. When falling back, backends are inferred from Metal, CUDA, and HIP/ROCm markers in combined `--help` output, with `cpu` always included.
 
 When a candidate is pruned or marked unsupported due to a capability mismatch, the `ScreeningResult.provenance` field and `reason` field document the specific capability that triggered the outcome (e.g. `flash_attn=unsupported`, `cache_k=q8_0=unsupported`).
 
@@ -885,7 +910,8 @@ These properties are verified by the `@pytest.mark.network` tests in `tests/test
 | `Binary not found` | llama-bench not installed or not in PATH | Install llama.cpp and ensure the binary is discoverable |
 | `Model not found` | GGUF model path is invalid | Verify the model file exists and is readable |
 | `Unsupported format` | File is not a `.gguf` file | Only GGUF models are supported |
-| `ToolchainError` | llama-bench --version/--help failed | Check your llama-bench build is functional |
+| Unrecognized `llama-bench --version` | Automatic fallback to `llama-cli --version` | No action required |
+| `ToolchainError` | `--version`/`--help` fails, or fallback also fails | Check that both llama-bench and llama-cli are functional |
 | `MalformedOutputError` | llama-bench output is not parseable | Update to a compatible llama-bench version |
 | `No accelerators detected` | Device selection without GPU | Use `--cpu-only` if no GPU is available |
 | `Session spec fingerprint mismatch` | Model changed between sessions | A new derived session will be created |
@@ -1009,7 +1035,7 @@ Known sessions:
 | Invalid GGUF file, bad magic, unsupported version, unknown type, or truncation | `ModelRejectedError` (preflight, no process launch) |
 | Invalid n_ctx composition | `InvalidNctxError` (preflight, no process launch) |
 | Candidate value out of range | `CandidateError` (preflight, no process launch) |
-| llama-bench `--version` or `--help` fails | `ToolchainError` (preflight, no process launch) |
+| llama-bench `--version` fails (non-unrecognized), or fallback `llama-cli --version` fails, or `--help` fails | `ToolchainError` (preflight, no process launch) |
 | Missing required `backends:` or `supported_output_formats:` in version output | `ToolchainError` |
 | llama-bench exits nonzero | `SubprocessError` including captured stderr |
 | Unparseable / malformed output | `MalformedOutputError` including raw output |
