@@ -172,6 +172,7 @@ def build_llama_cli_command(
     n_ctx: NctxComposition,
     model_path: str,
     *,
+    mmproj_path: str | None = None,
     cpu_only: bool = True,
     selected_device_ids: tuple[int, ...] = (),
 ) -> list[str]:
@@ -185,6 +186,8 @@ def build_llama_cli_command(
         "-ngl", str(candidate.n_gpu_layers),
     ]
     cmd.append(_flash_attn_flag(candidate))
+    if mmproj_path is not None:
+        cmd.extend(["--mmproj", mmproj_path])
     if candidate.cache_type_k != "f16":
         cmd.extend(["-ctk", candidate.cache_type_k])
     if candidate.cache_type_v != "f16":
@@ -201,6 +204,7 @@ def build_llama_server_command(
     n_ctx: NctxComposition,
     model_path: str,
     *,
+    mmproj_path: str | None = None,
     cpu_only: bool = True,
     selected_device_ids: tuple[int, ...] = (),
     draft_model_path: str | None = None,
@@ -216,6 +220,8 @@ def build_llama_server_command(
         "-ngl", str(candidate.n_gpu_layers),
     ]
     cmd.append(_flash_attn_flag(candidate))
+    if mmproj_path is not None:
+        cmd.extend(["--mmproj", mmproj_path])
     if candidate.cache_type_k != "f16":
         cmd.extend(["-ctk", candidate.cache_type_k])
     if candidate.cache_type_v != "f16":
@@ -240,32 +246,38 @@ def build_llama_server_command(
 def build_preset_ini_section(
     candidate: CandidateConfig,
     n_ctx: NctxComposition,
+    model_path: str,
     *,
+    mmproj_path: str | None = None,
     cpu_only: bool = True,
     selected_device_ids: tuple[int, ...] = (),
     draft_model_path: str | None = None,
     draft_settings: MtpDraftSettings | None = None,
 ) -> str:
-    lines: list[str] = ["[llama]"]
-    lines.append(f"n_ctx = {n_ctx.total}")
-    lines.append(f"n_batch = {candidate.batch_size}")
-    lines.append(f"n_ubatch = {candidate.ubatch_size}")
-    lines.append(f"n_threads = {candidate.threads}")
-    lines.append(f"n_gpu_layers = {candidate.n_gpu_layers}")
-    lines.append(f"flash_attn = {'true' if candidate.flash_attn else 'false'}")
-    lines.append(f"cache_type_k = {candidate.cache_type_k}")
-    lines.append(f"cache_type_v = {candidate.cache_type_v}")
+    section = Path(model_path).stem
+    lines: list[str] = [f"[{section}]"]
+    lines.append(f"model = {model_path}")
+    if mmproj_path is not None:
+        lines.append(f"mmproj = {mmproj_path}")
+    lines.append(f"ctx-size = {n_ctx.total}")
+    lines.append(f"batch-size = {candidate.batch_size}")
+    lines.append(f"ubatch-size = {candidate.ubatch_size}")
+    lines.append(f"threads = {candidate.threads}")
+    lines.append(f"n-gpu-layers = {candidate.n_gpu_layers}")
+    lines.append(f"flash-attn = {'true' if candidate.flash_attn else 'false'}")
+    lines.append(f"cache-type-k = {candidate.cache_type_k}")
+    lines.append(f"cache-type-v = {candidate.cache_type_v}")
     if candidate.n_cpu_moe is not None:
-        lines.append(f"n_cpu_moe = {candidate.n_cpu_moe}")
+        lines.append(f"n-cpu-moe = {candidate.n_cpu_moe}")
     if draft_model_path is not None:
-        lines.append(f"model_draft = {draft_model_path}")
+        lines.append(f"model-draft = {draft_model_path}")
     if draft_settings is not None:
-        lines.append(f"n_gpu_layers_draft = {draft_settings.n_gpu_layers_draft}")
+        lines.append(f"n-gpu-layers-draft = {draft_settings.n_gpu_layers_draft}")
         if draft_settings.n_cpu_moe_draft is not None:
-            lines.append(f"n_cpu_moe_draft = {draft_settings.n_cpu_moe_draft}")
-        lines.append(f"draft_max = {draft_settings.draft_max}")
+            lines.append(f"n-cpu-moe-draft = {draft_settings.n_cpu_moe_draft}")
+        lines.append(f"spec-draft-n-max = {draft_settings.draft_max}")
     if not cpu_only and selected_device_ids:
-        lines.append(f"main_gpu = {selected_device_ids[0]}")
+        lines.append(f"main-gpu = {selected_device_ids[0]}")
     lines.append("")
     return "\n".join(lines)
 
@@ -540,9 +552,11 @@ def _draft_settings_to_dict(ds: MtpDraftSettings) -> dict[str, object]:
 def _mtp_profile_to_dict(
     report: MtpProfileReport,
     *,
+    model_path: str,
     n_ctx: NctxComposition | None = None,
     cpu_only: bool = True,
     selected_device_ids: tuple[int, ...] = (),
+    mmproj_path: str | None = None,
 ) -> dict[str, object]:
     observations_list: list[dict[str, object]] = []
     for obs in report.observations:
@@ -575,7 +589,8 @@ def _mtp_profile_to_dict(
         draft_path = str(report.draft_fingerprint.path)
         if n_ctx is not None:
             preset = build_preset_ini_section(
-                report.mtp_main_candidate, n_ctx,
+                report.mtp_main_candidate, n_ctx, model_path,
+                mmproj_path=mmproj_path,
                 cpu_only=cpu_only,
                 selected_device_ids=selected_device_ids,
                 draft_model_path=draft_path,
@@ -667,6 +682,7 @@ def render_export_json(
     mtp_profile: MtpProfileReport | None = None,
     provenance: LaunchProvenance | None = None,
     include_hashes: bool = False,
+    mmproj_path: str | None = None,
 ) -> str:
     root: dict[str, object] = {
         "schema": REPORT_SCHEMA_VERSION,
@@ -689,9 +705,11 @@ def render_export_json(
     if mtp_profile is not None:
         root["mtp_profile"] = _mtp_profile_to_dict(
             mtp_profile,
+            model_path=str(model.path),
             n_ctx=session.n_ctx,
             cpu_only=session.cpu_only,
             selected_device_ids=session.selected_device_ids,
+            mmproj_path=mmproj_path,
         )
 
     candidates_repro, repro_notes = _collect_reproduction_candidates(
@@ -735,6 +753,7 @@ def render_export_json(
 
     root["reproduction_commands"] = _build_reproduction_commands(
         session, screening_report, validation_result,
+        mmproj_path=mmproj_path,
     )
 
     if include_hashes:
@@ -752,6 +771,7 @@ def _build_reproduction_commands(
     validation_result: ValidatedRecommendation | NoWinnerReport | None,
     *,
     model_path_override: str | None = None,
+    mmproj_path: str | None = None,
 ) -> dict[str, object]:
     commands: dict[str, object] = {}
     target: CandidateConfig | None = None
@@ -766,16 +786,19 @@ def _build_reproduction_commands(
         mp = model_path_override if model_path_override is not None else str(session.model.path)
         commands["llama_cli"] = build_llama_cli_command(
             target, n_ctx, mp,
+            mmproj_path=mmproj_path,
             cpu_only=session.cpu_only,
             selected_device_ids=session.selected_device_ids,
         )
         commands["llama_server"] = build_llama_server_command(
             target, n_ctx, mp,
+            mmproj_path=mmproj_path,
             cpu_only=session.cpu_only,
             selected_device_ids=session.selected_device_ids,
         )
         commands["preset_ini"] = build_preset_ini_section(
-            target, n_ctx,
+            target, n_ctx, mp,
+            mmproj_path=mmproj_path,
             cpu_only=session.cpu_only,
             selected_device_ids=session.selected_device_ids,
         )
@@ -826,6 +849,7 @@ def render_export_markdown(
     mtp_profile: MtpProfileReport | None = None,
     provenance: LaunchProvenance | None = None,
     include_hashes: bool = False,
+    mmproj_path: str | None = None,
 ) -> str:
     lines: list[str] = []
     lines.append("# llama-parameter-scout Report")
@@ -991,9 +1015,11 @@ def render_export_markdown(
             lines.append("")
 
             # Compatible production commands only for leader/recommendation
+            _md_mmproj = redact_path(mmproj_path) if mmproj_path else None
             prod_cmds = _build_reproduction_commands(
                 session, screening_report, validation_result,
                 model_path_override=redact_path(str(session.model.path)),
+                mmproj_path=_md_mmproj,
             )
             cli_cmd = prod_cmds.get("llama_cli")
             if isinstance(cli_cmd, list):
@@ -1099,8 +1125,10 @@ def render_export_markdown(
     elif screening_report is not None and screening_report.leader is not None:
         preset_target = screening_report.leader.candidate
     if preset_target is not None:
+        _md_mmproj2 = redact_path(mmproj_path) if mmproj_path else None
         preset = build_preset_ini_section(
-            preset_target, session.n_ctx,
+            preset_target, session.n_ctx, redact_path(str(session.model.path)),
+            mmproj_path=_md_mmproj2,
             cpu_only=session.cpu_only,
             selected_device_ids=session.selected_device_ids,
         )
@@ -1116,8 +1144,10 @@ def render_export_markdown(
             and mtp_profile.recommendation is not None
             and mtp_profile.mtp_main_candidate is not None
             and mtp_profile.winning_draft_settings is not None):
+        _md_mmproj3 = redact_path(mmproj_path) if mmproj_path else None
         mtp_preset = build_preset_ini_section(
-            mtp_profile.mtp_main_candidate, session.n_ctx,
+            mtp_profile.mtp_main_candidate, session.n_ctx, redact_path(str(session.model.path)),
+            mmproj_path=_md_mmproj3,
             cpu_only=session.cpu_only,
             selected_device_ids=session.selected_device_ids,
             draft_model_path=redact_path(str(mtp_profile.draft_fingerprint.path)),

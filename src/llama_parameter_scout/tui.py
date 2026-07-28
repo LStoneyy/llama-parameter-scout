@@ -4,7 +4,7 @@ import subprocess
 import sys
 import threading
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol, cast, runtime_checkable
 
@@ -91,7 +91,8 @@ def _copy_to_clipboard(text: str) -> bool:
 class WizardState:
     llama_bench_path: str = ""
     model_path: str = ""
-    journal_path: str = ""
+    mmproj_path: str = ""
+    journal_path: str = field(default_factory=lambda: str(Path.cwd() / "journal.json"))
     draft_model_path: str = ""
     server_path: str = ""
     cpu_only: bool = True
@@ -107,6 +108,8 @@ class WizardState:
     budget_vram: str = ""
     mtp_enabled: bool = False
     headroom_ratio: str = "0.1"
+    cache_type_k: str = "f16"
+    cache_type_v: str = "f16"
 
 
 # ── Application protocol ─────────────────────────────────────────
@@ -193,6 +196,7 @@ class TuiApplication(Protocol):
         mtp_profile: MtpProfileReport | None = None,
         provenance: Any | None = None,
         include_hashes: bool = False,
+        mmproj_path: str | None = None,
     ) -> str: ...
 
 
@@ -210,6 +214,7 @@ class PreparedSession:
     runner: ProcessRunner
     base_candidate: CandidateConfig
     n_ctx: NctxComposition
+    mmproj_path: str | None = None
 
 
 # ── Messages ─────────────────────────────────────────────────────
@@ -501,6 +506,12 @@ class WizardScreen(Screen[ScoutTuiApp]):
                 Button("Browse", id="browse_model_btn"),
                 classes="browse-row",
             )
+            yield Label("MMProj path (optional)")
+            yield Horizontal(
+                Input(placeholder="/path/to/mmproj.gguf", id="mmproj_path"),
+                Button("Browse", id="browse_mmproj_btn"),
+                classes="browse-row",
+            )
             yield Label("Journal path")
             yield Horizontal(
                 Input(placeholder="/path/to/journal.json", id="journal_path"),
@@ -549,6 +560,28 @@ class WizardScreen(Screen[ScoutTuiApp]):
             yield Input(value="512", id="n_ctx_depth")
             yield Checkbox("Acknowledge context risk", id="acknowledged")
 
+            yield Label("KV Cache", classes="section-title")
+            yield Label("Key cache type")
+            yield Select(
+                [("f16 (higher precision)", "f16"),
+                 ("q8_0 (8-bit)", "q8_0"),
+                 ("q4_0 (4-bit, smallest)", "q4_0")],
+                prompt="Key cache type",
+                value="f16",
+                allow_blank=False,
+                id="cache_type_k",
+            )
+            yield Label("Value cache type")
+            yield Select(
+                [("f16 (higher precision)", "f16"),
+                 ("q8_0 (8-bit)", "q8_0"),
+                 ("q4_0 (4-bit, smallest)", "q4_0")],
+                prompt="Value cache type",
+                value="f16",
+                allow_blank=False,
+                id="cache_type_v",
+            )
+
             yield Label("Search Profile", classes="section-title")
             yield Select(
                 [(p, p) for p in ("quick", "standard", "thorough")],
@@ -587,6 +620,7 @@ class WizardScreen(Screen[ScoutTuiApp]):
         state = self._tui.wizard_state
         self.query_one("#llama_bench_path", Input).value = state.llama_bench_path
         self.query_one("#model_path", Input).value = state.model_path
+        self.query_one("#mmproj_path", Input).value = state.mmproj_path
         self.query_one("#journal_path", Input).value = state.journal_path
         self.query_one("#draft_model_path", Input).value = state.draft_model_path
         self.query_one("#server_path", Input).value = state.server_path
@@ -599,6 +633,8 @@ class WizardScreen(Screen[ScoutTuiApp]):
         self.query_one("#budget_vram", Input).value = state.budget_vram
         self.query_one("#headroom_ratio", Input).value = state.headroom_ratio
         self.query_one("#mtp_enabled", Checkbox).value = state.mtp_enabled
+        self.query_one("#cache_type_k", Select).value = state.cache_type_k
+        self.query_one("#cache_type_v", Select).value = state.cache_type_v
         self._restore_context_preset()
 
     def _restore_context_preset(self) -> None:
@@ -656,6 +692,13 @@ class WizardScreen(Screen[ScoutTuiApp]):
             if path is not None:
                 self.query_one("#llama_bench_path", Input).value = str(path)
         self.app.push_screen(_BenchFileBrowser(), on_select)
+
+    @on(Button.Pressed, "#browse_mmproj_btn")
+    def _open_mmproj_browser(self) -> None:
+        def on_select(path: Path | None) -> None:
+            if path is not None:
+                self.query_one("#mmproj_path", Input).value = str(path)
+        self.app.push_screen(ModelFileBrowser(), on_select)
 
     @on(Button.Pressed, "#browse_journal_btn")
     def _open_journal_browser(self) -> None:
@@ -782,6 +825,7 @@ class WizardScreen(Screen[ScoutTuiApp]):
         state = self._tui.wizard_state
         state.llama_bench_path = self.query_one("#llama_bench_path", Input).value.strip()
         state.model_path = self.query_one("#model_path", Input).value.strip()
+        state.mmproj_path = self.query_one("#mmproj_path", Input).value.strip()
         state.journal_path = self.query_one("#journal_path", Input).value.strip()
         state.draft_model_path = self.query_one("#draft_model_path", Input).value.strip()
         state.server_path = self.query_one("#server_path", Input).value.strip()
@@ -801,6 +845,8 @@ class WizardScreen(Screen[ScoutTuiApp]):
         state.budget_vram = self.query_one("#budget_vram", Input).value.strip()
         state.headroom_ratio = self.query_one("#headroom_ratio", Input).value.strip()
         state.mtp_enabled = self.query_one("#mtp_enabled", Checkbox).value
+        state.cache_type_k = str(self.query_one("#cache_type_k", Select).value or "f16")
+        state.cache_type_v = str(self.query_one("#cache_type_v", Select).value or "f16")
 
         profile_widget = self.query_one("#profile", Select)
         if profile_widget.value is not None:
@@ -818,6 +864,9 @@ class WizardScreen(Screen[ScoutTuiApp]):
             errs.append("Model path is required")
         elif not Path(state.model_path).exists():
             errs.append(f"Model not found: {state.model_path}")
+
+        if state.mmproj_path and not Path(state.mmproj_path).exists():
+            errs.append(f"MMProj not found: {state.mmproj_path}")
 
         if not state.journal_path:
             errs.append("Journal path is required")
@@ -936,8 +985,8 @@ class ReviewScreen(Screen[ScoutTuiApp]):
                 ubatch_size=512,
                 n_gpu_layers=0,
                 flash_attn=False,
-                cache_type_k="f16",
-                cache_type_v="f16",
+                cache_type_k=state.cache_type_k,
+                cache_type_v=state.cache_type_v,
             )
 
             profile = get_profile(state.profile_label)
@@ -983,6 +1032,8 @@ class ReviewScreen(Screen[ScoutTuiApp]):
                 binary_source="explicit",
             )
 
+            mmproj = state.mmproj_path if state.mmproj_path else None
+
             prepared = PreparedSession(
                 app=app,
                 spec=spec,
@@ -993,6 +1044,7 @@ class ReviewScreen(Screen[ScoutTuiApp]):
                 runner=runner,
                 base_candidate=base_candidate,
                 n_ctx=n_ctx,
+                mmproj_path=mmproj,
             )
 
             if worker.is_cancelled:
@@ -1024,6 +1076,8 @@ class ReviewScreen(Screen[ScoutTuiApp]):
         lines.append(f"llama-bench: {prepared.toolchain.binary_path}")
         lines.append(f"Model: {spec.model.path}")
         lines.append(f"Model name: {spec.model.path.name} ({spec.model.architecture})")
+        if state.mmproj_path:
+            lines.append(f"MMProj: {state.mmproj_path}")
         lines.append(f"Journal: {state.journal_path}")
         if spec.cpu_only:
             lines.append("Device: CPU-only")
@@ -1063,6 +1117,7 @@ class ReviewScreen(Screen[ScoutTuiApp]):
         if state.mtp_enabled:
             lines.append(f"Draft model: {state.draft_model_path}")
             lines.append(f"Server: {state.server_path}")
+        lines.append(f"KV cache: K={state.cache_type_k}, V={state.cache_type_v}")
         self.query_one("#review-content", Static).update("\n".join(lines))
 
     @on(Button.Pressed, "#start_btn")
@@ -1386,6 +1441,7 @@ class ResultsScreen(Screen[ScoutTuiApp]):
                         screening_report=screening_report,
                         validation_result=validation_result,
                         mtp_profile=mtp_profile,
+                        mmproj_path=prepared.mmproj_path,
                     )
                     md_lines.append(md)
                 else:
@@ -1428,6 +1484,8 @@ class ResultsScreen(Screen[ScoutTuiApp]):
                     build_preset_ini_section(
                         target,
                         session_spec.n_ctx,
+                        str(session_spec.model.path),
+                        mmproj_path=prepared.mmproj_path if prepared else None,
                         cpu_only=session_spec.cpu_only,
                         selected_device_ids=session_spec.selected_device_ids,
                     )
@@ -1438,7 +1496,7 @@ class ResultsScreen(Screen[ScoutTuiApp]):
             preset_lines.append("; No validated recommendation -- preset.ini unavailable.")
         else:
             preset_lines.append("; Benchmark was cancelled -- no preset available.")
-        self.query_one("#preset-content", RichLog).write("\n" + "\n".join(preset_lines))
+        self.query_one("#preset-content", RichLog).write("\n".join(preset_lines))
 
         shell_lines: list[str] = []
         if validated_vr is not None and session_spec is not None and toolchain is not None:
@@ -1451,8 +1509,10 @@ class ResultsScreen(Screen[ScoutTuiApp]):
                     build_reproduction_argv,
                     join_argv,
                 )
+                mmproj = prepared.mmproj_path if prepared else None
                 cli_cmd = build_llama_cli_command(
                     target, session_spec.n_ctx, mp,
+                    mmproj_path=mmproj,
                     cpu_only=session_spec.cpu_only,
                     selected_device_ids=session_spec.selected_device_ids,
                 )
@@ -1461,6 +1521,7 @@ class ResultsScreen(Screen[ScoutTuiApp]):
                 shell_lines.append("")
                 srv_cmd = build_llama_server_command(
                     target, session_spec.n_ctx, mp,
+                    mmproj_path=mmproj,
                     cpu_only=session_spec.cpu_only,
                     selected_device_ids=session_spec.selected_device_ids,
                 )
@@ -1486,7 +1547,7 @@ class ResultsScreen(Screen[ScoutTuiApp]):
             shell_lines.append(
                 "# Benchmark was cancelled -- no commands available."
             )
-        self.query_one("#shell-content", RichLog).write("\n" + "\n".join(shell_lines))
+        self.query_one("#shell-content", RichLog).write("\n".join(shell_lines))
 
     @on(Button.Pressed, "#copy_md_btn")
     def action_copy_markdown(self) -> None:
@@ -1502,7 +1563,7 @@ class ResultsScreen(Screen[ScoutTuiApp]):
 
     def _do_copy(self, widget_id: str, label: str) -> None:
         widget = self.query_one(widget_id, RichLog)
-        text = "\n".join(str(line) for line in widget.lines)
+        text = "\n".join(str(line.text) for line in widget.lines)
         if _copy_to_clipboard(text):
             self.query_one("#clipboard-msg", Static).update(
                 f"[green]Copied {label} to clipboard[/]"
@@ -1521,12 +1582,14 @@ class ResultsScreen(Screen[ScoutTuiApp]):
 
         base_dir = Path.cwd()
         try:
-            md_text = "\n".join(str(line) for line in self.query_one("#md-content", RichLog).lines)
+            md_text = "\n".join(
+                str(line.text) for line in self.query_one("#md-content", RichLog).lines
+            )
             preset_text = "\n".join(
-                str(line) for line in self.query_one("#preset-content", RichLog).lines
+                str(line.text) for line in self.query_one("#preset-content", RichLog).lines
             )
             shell_text = "\n".join(
-                str(line) for line in self.query_one("#shell-content", RichLog).lines
+                str(line.text) for line in self.query_one("#shell-content", RichLog).lines
             )
             (base_dir / "scout-report.md").write_text(md_text)
             (base_dir / "preset.ini").write_text(preset_text)

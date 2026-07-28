@@ -60,6 +60,10 @@ benchmarks/output/
 benchmark-results/
 *.benchmark.json
 *.benchmark.csv
+/journal.json
+/preset.ini
+/scout-report.md
+/shell-commands.txt
 
 # Local models and model-related files
 *.gguf

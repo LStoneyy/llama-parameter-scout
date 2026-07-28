@@ -6,6 +6,7 @@ import pytest
 
 from llama_parameter_scout.application import (
     Application,
+    _check_resource_budget,
     _compute_model_weight_bytes,
     _estimate_advisory,
 )
@@ -460,9 +461,29 @@ def test_advisory_sensitive_to_model_footprint() -> None:
 def test_advisory_sensitive_to_cache_type() -> None:
     budget = ResourceBudget(ram_bytes=256_000_000_000, vram_bytes=None, headroom_ratio=0.1)
     model = _make_model(context_length=256000)
-    f32_adv = _estimate_advisory(model, SAMPLE_NCTX, budget, cache_type="f32")
-    f16_adv = _estimate_advisory(model, SAMPLE_NCTX, budget, cache_type="f16")
+    f32_adv = _estimate_advisory(model, SAMPLE_NCTX, budget, cache_type_k="f32", cache_type_v="f32")
+    f16_adv = _estimate_advisory(model, SAMPLE_NCTX, budget, cache_type_k="f16", cache_type_v="f16")
     assert f32_adv.likely_fit_upper < f16_adv.likely_fit_upper
+
+
+def test_advisory_q4_0_permits_larger_context_than_f16() -> None:
+    budget = ResourceBudget(ram_bytes=256_000_000_000, vram_bytes=None, headroom_ratio=0.1)
+    model = _make_model(context_length=None)
+    q4_adv = _estimate_advisory(
+        model, SAMPLE_NCTX, budget, cache_type_k="q4_0", cache_type_v="q4_0",
+    )
+    f16_adv = _estimate_advisory(model, SAMPLE_NCTX, budget, cache_type_k="f16", cache_type_v="f16")
+    assert q4_adv.kv_cache_bytes_estimate < f16_adv.kv_cache_bytes_estimate
+    assert q4_adv.likely_fit_upper > f16_adv.likely_fit_upper
+
+
+def test_advisory_sensitive_to_cache_type_v_only() -> None:
+    budget = ResourceBudget(ram_bytes=256_000_000_000, vram_bytes=None, headroom_ratio=0.1)
+    model = _make_model(context_length=None)
+    f16_f16 = _estimate_advisory(model, SAMPLE_NCTX, budget, cache_type_k="f16", cache_type_v="f16")
+    f16_q4 = _estimate_advisory(model, SAMPLE_NCTX, budget, cache_type_k="f16", cache_type_v="q4_0")
+    assert f16_q4.kv_cache_bytes_estimate < f16_f16.kv_cache_bytes_estimate
+    assert f16_q4.likely_fit_upper > f16_f16.likely_fit_upper
 
 
 def test_advisory_sensitive_to_budget() -> None:
@@ -513,6 +534,36 @@ def test_advisory_known_context_bounds_upper() -> None:
     known_model = _make_model(context_length=1024)
     known_adv = _estimate_advisory(known_model, SAMPLE_NCTX, budget)
     assert known_adv.likely_fit_upper <= 1024
+
+
+def test_resource_gate_sensitive_to_cache_type_v() -> None:
+    topology = SystemTopology(
+        cpu_count=8, system_memory_bytes=1_000_000_000,
+        accelerators=(), memory_unified=True,
+    )
+    model = _make_model(context_length=4096)
+    budget = ResourceBudget(ram_bytes=900_000_000, vram_bytes=None, headroom_ratio=0.0)
+    nctx = NctxComposition(total=2048, prompt=512, generation=1024, depth=512)
+    spec = SessionSpecification(
+        topology=topology, cpu_only=True, selected_device_ids=(),
+        n_ctx=nctx, budget=budget, advisory=None,  # type: ignore[arg-type]
+        model=model, acknowledged=True, fingerprint="x",
+    )
+    f16_both = CandidateConfig(
+        threads=4, batch_size=512, ubatch_size=512,
+        n_gpu_layers=0, flash_attn=False,
+        cache_type_k="f16", cache_type_v="f16",
+    )
+    f16_q4_v = CandidateConfig(
+        threads=4, batch_size=512, ubatch_size=512,
+        n_gpu_layers=0, flash_attn=False,
+        cache_type_k="f16", cache_type_v="q4_0",
+    )
+    outcome_f16 = _check_resource_budget(spec, nctx, f16_both)
+    outcome_mixed = _check_resource_budget(spec, nctx, f16_q4_v)
+    assert outcome_f16 is not None
+    assert outcome_f16.disposition == "budget_exhausted"
+    assert outcome_mixed is None
 
 
 def test_fingerprint_deterministic() -> None:
@@ -708,6 +759,30 @@ def test_compute_model_weight_bytes_shards_only(tmp_path: Path) -> None:
         symlink_warning=False, network_mount_detected=False, diagnostics=(),
     )
     assert _compute_model_weight_bytes(model) == 2000
+
+
+def test_build_workload_session_spec_non_f16_cache_reflected_in_advisory() -> None:
+    from llama_parameter_scout.application import _build_workload_session_spec
+
+    topology = _make_topology()
+    model = _make_model()
+    base_spec = SessionSpecification(
+        topology=topology, cpu_only=True, selected_device_ids=(),
+        n_ctx=SAMPLE_NCTX,
+        budget=ResourceBudget(ram_bytes=32_000_000_000, vram_bytes=None, headroom_ratio=0.1),
+        advisory=None,  # type: ignore[arg-type]
+        model=model, acknowledged=True, fingerprint="base",
+    )
+    workload_nctx = NctxComposition(total=4096, prompt=1024, generation=2048, depth=1024)
+    candidate = CandidateConfig(
+        threads=4, batch_size=512, ubatch_size=512,
+        n_gpu_layers=0, flash_attn=False,
+        cache_type_k="q8_0", cache_type_v="q4_0",
+    )
+    spec_f16 = _build_workload_session_spec(base_spec, workload_nctx)
+    spec_non_f16 = _build_workload_session_spec(base_spec, workload_nctx, candidate=candidate)
+    assert spec_non_f16.advisory.kv_cache_bytes_estimate < spec_f16.advisory.kv_cache_bytes_estimate
+    assert spec_non_f16.advisory.uncertain_maximum > spec_f16.advisory.uncertain_maximum
 
 
 def test_setup_session_rejects_n_gpu_layers_below_minus_one() -> None:

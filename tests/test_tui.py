@@ -277,6 +277,31 @@ async def test_wizard_validation_empty_paths() -> None:
         text = _text(ws.query_one("#wizard_errors"))
         assert "llama-bench path is required" in text
         assert "Model path is required" in text
+        assert "Journal path is required" not in text
+
+
+async def test_wizard_default_journal_path(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.chdir(tmp_path)
+    app = ScoutTuiApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        expected = str(tmp_path / "journal.json")
+        assert ws.query_one("#journal_path", Input).value == expected
+        assert app.wizard_state.journal_path == expected
+
+
+async def test_wizard_validation_cleared_journal_shows_required() -> None:
+    app = ScoutTuiApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        ws.query_one("#journal_path", Input).value = ""
+        ws.action_next_screen()
+        await pilot.pause()
+        text = _text(ws.query_one("#wizard_errors"))
         assert "Journal path is required" in text
 
 
@@ -564,6 +589,92 @@ async def test_wizard_browse_journal_select_non_json_noop(tmp_path: Path) -> Non
         assert ws.query_one("#journal_path", Input).value == initial
 
 
+async def test_wizard_mmproj_input_present() -> None:
+    app = ScoutTuiApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        mmproj_input = ws.query_one("#mmproj_path", Input)
+        assert mmproj_input is not None
+        assert mmproj_input.placeholder == "/path/to/mmproj.gguf"
+
+
+async def test_wizard_mmproj_browse_populates_input(tmp_path: Path) -> None:
+    gguf = tmp_path / "mmproj.gguf"
+    gguf.write_text("")
+    app = ScoutTuiApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        ws._open_mmproj_browser()
+        await pilot.pause()
+        assert isinstance(app.screen, ModelFileBrowser)
+        app.screen._on_file_selected(type("_E", (), {"path": gguf})())
+        await pilot.pause()
+        assert isinstance(app.screen, WizardScreen)
+        assert ws.query_one("#mmproj_path", Input).value == str(gguf)
+
+
+async def test_wizard_mmproj_empty_is_valid(tmp_path: Path) -> None:
+    app = ScoutTuiApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        bench = tmp_path / "llama-bench"
+        bench.write_text("#!/bin/sh\necho ok")
+        bench.chmod(0o755)
+        model = tmp_path / "model.gguf"
+        model.write_text("GGUF")
+        ws.query_one("#llama_bench_path", Input).value = str(bench)
+        ws.query_one("#model_path", Input).value = str(model)
+        ws.query_one("#journal_path", Input).value = str(tmp_path / "j.json")
+        ws.query_one("#mmproj_path", Input).value = ""
+        errs = ws._gather_and_validate()
+        assert not any("MMProj" in e for e in errs)
+
+
+async def test_wizard_mmproj_nonexistent_reports_error(tmp_path: Path) -> None:
+    app = ScoutTuiApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        bench = tmp_path / "llama-bench"
+        bench.write_text("#!/bin/sh\necho ok")
+        bench.chmod(0o755)
+        model = tmp_path / "model.gguf"
+        model.write_text("GGUF")
+        ws.query_one("#llama_bench_path", Input).value = str(bench)
+        ws.query_one("#model_path", Input).value = str(model)
+        ws.query_one("#journal_path", Input).value = str(tmp_path / "j.json")
+        nonexistent = str(tmp_path / "nonexistent.gguf")
+        ws.query_one("#mmproj_path", Input).value = nonexistent
+        errs = ws._gather_and_validate()
+        assert any("MMProj not found" in e for e in errs)
+
+
+async def test_wizard_mmproj_browse_filters_non_gguf(tmp_path: Path) -> None:
+    app = ScoutTuiApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        ws._open_mmproj_browser()
+        await pilot.pause()
+        assert isinstance(app.screen, ModelFileBrowser)
+        txt_file = tmp_path / "data.txt"
+        txt_file.write_text("")
+        gguf_file = tmp_path / "mmproj.gguf"
+        gguf_file.write_text("")
+        tree = app.screen.query_one(GGUFDirectoryTree)
+        filtered = list(tree.filter_paths([txt_file, gguf_file, tmp_path]))
+        assert txt_file not in filtered
+        assert gguf_file in filtered
+
+
 async def test_wizard_browse_journal_filters_non_json(tmp_path: Path) -> None:
     app = ScoutTuiApp()
     async with app.run_test() as pilot:
@@ -709,6 +820,50 @@ async def test_wizard_context_preset_restores_custom() -> None:
         assert ws.query_one("#lbl_n_ctx_total").display
 
 
+# ── KV Cache type tests ──────────────────────────────────────────
+
+
+async def test_wizard_kv_cache_defaults() -> None:
+    app = ScoutTuiApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        assert ws.query_one("#cache_type_k", Select).value == "f16"
+        assert ws.query_one("#cache_type_v", Select).value == "f16"
+        assert app.wizard_state.cache_type_k == "f16"
+        assert app.wizard_state.cache_type_v == "f16"
+
+
+async def test_wizard_kv_cache_selection_reaches_setup_session(tmp_path: Path) -> None:
+    fa = FakeApp()
+    app = ScoutTuiApp(app_factory=lambda r: fa, **_tui_kw())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        _setup_wizard(app, tmp_path)
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        ws.query_one("#cache_type_k", Select).value = "q4_0"
+        ws.query_one("#cache_type_v", Select).value = "q8_0"
+        await pilot.pause()
+        ws._gather_and_validate()
+        assert app.wizard_state.cache_type_k == "q4_0"
+        assert app.wizard_state.cache_type_v == "q8_0"
+        await pilot.press("f10")
+        await pilot.pause()
+        assert isinstance(app.screen, ReviewScreen)
+        for _ in range(100):
+            if not app.screen.query_one("#start_btn").disabled:
+                break
+            await pilot.pause()
+        call = fa.calls["setup_session"][-1]
+        candidate = call["candidate"]
+        assert candidate.cache_type_k == "q4_0"
+        assert candidate.cache_type_v == "q8_0"
+        content = _text(app.screen.query_one("#review-content"))
+        assert "KV cache: K=q4_0, V=q8_0" in content
+
+
 # ── Review screen ───────────────────────────────────────────────
 
 
@@ -729,6 +884,46 @@ async def test_review_shows_full_spec(tmp_path: Path) -> None:
         assert "llama-bench" in content
         assert "test-fp-1234-full-fingerprint" in content
         assert "Test advisory note" in content
+
+
+async def test_review_shows_mmproj_when_set(tmp_path: Path) -> None:
+    fa = FakeApp()
+    app = ScoutTuiApp(app_factory=lambda r: fa, **_tui_kw())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        _setup_wizard(app, tmp_path)
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        mmproj_file = tmp_path / "mmproj.gguf"
+        mmproj_file.write_text("GGUF")
+        ws.query_one("#mmproj_path", Input).value = str(mmproj_file)
+        await pilot.press("f10")
+        await pilot.pause()
+        assert isinstance(app.screen, ReviewScreen)
+        for _ in range(100):
+            if not app.screen.query_one("#start_btn").disabled:
+                break
+            await pilot.pause()
+        content = _text(app.screen.query_one("#review-content"))
+        assert "MMProj" in content
+        assert str(mmproj_file) in content
+
+
+async def test_review_mmproj_not_shown_when_empty(tmp_path: Path) -> None:
+    fa = FakeApp()
+    app = ScoutTuiApp(app_factory=lambda r: fa, **_tui_kw())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        _setup_wizard(app, tmp_path)
+        await pilot.press("f10")
+        await pilot.pause()
+        assert isinstance(app.screen, ReviewScreen)
+        for _ in range(100):
+            if not app.screen.query_one("#start_btn").disabled:
+                break
+            await pilot.pause()
+        content = _text(app.screen.query_one("#review-content"))
+        assert "MMProj" not in content
 
 
 async def test_review_never_calls_start_or_resume(tmp_path: Path) -> None:
@@ -1067,6 +1262,137 @@ async def test_results_validated_shows_report() -> None:
         assert "Validated" in md or "Report" in md
 
 
+async def test_results_preset_export_plain_text(tmp_path: Path, monkeypatch: Any) -> None:
+    fa = FakeApp()
+    spec = _make_spec()
+    app = ScoutTuiApp(app_factory=lambda r: fa, **_tui_kw())
+    app.prepared = _make_prepared(fa)
+    app.run_result = {
+        "session_spec": spec, "screening_report": None,
+        "validation_result": _make_vr(), "mtp_profile": None,
+        "toolchain": _make_tc(), "model": _make_model(),
+        "session_result": None, "request": None, "cancelled": False,
+    }
+
+    def _fake_copy(t: str) -> bool:
+        clipboard_text.append(t)
+        return True
+
+    clipboard_text: list[str] = []
+    monkeypatch.setattr(
+        "llama_parameter_scout.tui._copy_to_clipboard",
+        _fake_copy,
+    )
+
+    async with app.run_test() as pilot:
+        app.push_screen(ResultsScreen())
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, ResultsScreen)
+        tabs = screen.query_one(TabbedContent)
+        tabs.active = "tab-preset"
+        await pilot.pause()
+
+        visible = _text(screen.query_one("#preset-content"))
+        assert visible.startswith("[model]")
+
+        screen.action_copy_preset()
+        await pilot.pause()
+        assert len(clipboard_text) == 1
+        copied = clipboard_text[0]
+        assert copied.startswith("[model]")
+        assert "Strip(" not in copied, (
+            f"BUG: action_copy_preset exported Strip( repr.\n{copied}"
+        )
+
+        cwd = Path.cwd()
+        try:
+            import os
+            os.chdir(str(tmp_path))
+            screen.action_save_all()
+            await pilot.pause()
+            saved = (tmp_path / "preset.ini").read_text()
+            assert saved.startswith("[model]")
+            assert "Strip(" not in saved, (
+                f"BUG: action_save_all wrote Strip( repr.\n{saved}"
+            )
+        finally:
+            os.chdir(str(cwd))
+
+
+async def test_results_preset_includes_mmproj_when_set(tmp_path: Path) -> None:
+    fa = FakeApp()
+    spec = _make_spec()
+    app = ScoutTuiApp(app_factory=lambda r: fa, **_tui_kw())
+    mmproj_file = tmp_path / "mmproj.gguf"
+    mmproj_file.write_text("GGUF")
+    prepared = _make_prepared(fa)
+    prepared.mmproj_path = str(mmproj_file)
+    app.prepared = prepared
+    app.run_result = {
+        "session_spec": spec, "screening_report": None,
+        "validation_result": _make_vr(), "mtp_profile": None,
+        "toolchain": _make_tc(), "model": _make_model(),
+        "session_result": None, "request": None, "cancelled": False,
+    }
+    async with app.run_test() as pilot:
+        app.push_screen(ResultsScreen())
+        await pilot.pause()
+        tabs = app.screen.query_one(TabbedContent)
+        tabs.active = "tab-preset"
+        await pilot.pause()
+        visible = _text(app.screen.query_one("#preset-content"))
+        assert str(mmproj_file) in visible
+        assert "mmproj =" in visible
+
+
+async def test_results_preset_no_mmproj_when_empty(tmp_path: Path) -> None:
+    fa = FakeApp()
+    spec = _make_spec()
+    app = ScoutTuiApp(app_factory=lambda r: fa, **_tui_kw())
+    app.prepared = _make_prepared(fa)
+    app.run_result = {
+        "session_spec": spec, "screening_report": None,
+        "validation_result": _make_vr(), "mtp_profile": None,
+        "toolchain": _make_tc(), "model": _make_model(),
+        "session_result": None, "request": None, "cancelled": False,
+    }
+    async with app.run_test() as pilot:
+        app.push_screen(ResultsScreen())
+        await pilot.pause()
+        tabs = app.screen.query_one(TabbedContent)
+        tabs.active = "tab-preset"
+        await pilot.pause()
+        visible = _text(app.screen.query_one("#preset-content"))
+        assert "mmproj =" not in visible
+
+
+async def test_results_shell_includes_mmproj_in_commands(tmp_path: Path) -> None:
+    fa = FakeApp()
+    spec = _make_spec()
+    app = ScoutTuiApp(app_factory=lambda r: fa, **_tui_kw())
+    mmproj_file = tmp_path / "mmproj.gguf"
+    mmproj_file.write_text("GGUF")
+    prepared = _make_prepared(fa)
+    prepared.mmproj_path = str(mmproj_file)
+    app.prepared = prepared
+    app.run_result = {
+        "session_spec": spec, "screening_report": None,
+        "validation_result": _make_vr(), "mtp_profile": None,
+        "toolchain": _make_tc(), "model": _make_model(),
+        "session_result": None, "request": None, "cancelled": False,
+    }
+    async with app.run_test() as pilot:
+        app.push_screen(ResultsScreen())
+        await pilot.pause()
+        tabs = app.screen.query_one(TabbedContent)
+        tabs.active = "tab-shell"
+        await pilot.pause()
+        visible = _text(app.screen.query_one("#shell-content"))
+        assert str(mmproj_file) in visible
+        assert "--mmproj" in visible
+
+
 async def test_results_nowinner_shows_no_winner() -> None:
     class NoWinnerFakeApp(FakeApp):
         def export_report_markdown(self, **kw: Any) -> str:
@@ -1238,3 +1564,25 @@ async def test_validate_candidates_emits_progress() -> None:
     assert any(e.stage == "validation" and "Validating" in e.message for e in events)
     assert any(e.stage == "validation" and "Validated" in e.message for e in events)
     assert isinstance(result, ValidatedRecommendation)
+
+
+async def test_results_passes_mmproj_to_export_report_markdown() -> None:
+    fa = FakeApp()
+    spec = _make_spec()
+    app = ScoutTuiApp(app_factory=lambda r: fa, **_tui_kw())
+    mmproj_file = "/opt/mmproj/mmproj.gguf"
+    prepared = _make_prepared(fa)
+    prepared.mmproj_path = mmproj_file
+    app.prepared = prepared
+    app.run_result = {
+        "session_spec": spec, "screening_report": None,
+        "validation_result": _make_vr(), "mtp_profile": None,
+        "toolchain": _make_tc(), "model": _make_model(),
+        "session_result": None, "request": None, "cancelled": False,
+    }
+    async with app.run_test() as pilot:
+        app.push_screen(ResultsScreen())
+        await pilot.pause()
+        assert len(fa.calls["export_report_markdown"]) == 1
+        kwargs = fa.calls["export_report_markdown"][0]
+        assert kwargs.get("mmproj_path") == mmproj_file

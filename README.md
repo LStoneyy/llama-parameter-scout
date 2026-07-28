@@ -115,6 +115,8 @@ Browse buttons appear next to the llama-bench, model, journal, and draft model i
 
 Manual input remains editable after a browse selection. A nonexistent journal path can still be typed directly.
 
+The **journal path** defaults to `<current working directory>/journal.json`, created lazily on first session write; the field remains editable or browsable. This repo ignores `/journal.json` (repo-root journal file).
+
 ### Device detection
 
 On screen mount, device topology is detected asynchronously. A status label shows "Detecting..." then the result:
