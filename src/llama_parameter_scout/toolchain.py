@@ -19,6 +19,20 @@ _CACHE_TYPE_HELP_RE = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 
+# Fallback: parse option aliases from --help lines like:
+#   -h, --help
+#   -m, --model <FNAME>
+#   --no-warmup
+_HELP_OPTION_RE = re.compile(
+    r"^\s{2,4}((?:-[a-zA-Z][a-zA-Z0-9]*(?:,\s*--[a-zA-Z0-9_-]+)?"
+    r"|--[a-zA-Z0-9_-]+))(?=\s|<|$)",
+    re.MULTILINE,
+)
+_HELP_OUTPUT_FORMATS_RE = re.compile(
+    r"--output\b[^<]*<([a-z|]+)>",
+    re.MULTILINE | re.IGNORECASE,
+)
+
 
 def _platform_binary_names() -> list[str]:
     if os.name == "nt":
@@ -28,6 +42,27 @@ def _platform_binary_names() -> list[str]:
 
 def _is_executable_regular(path: Path) -> bool:
     return path.is_file() and os.access(str(path), os.X_OK)
+
+
+def _sibling_cli_path(binary_path: Path) -> Path:
+    parent = binary_path.parent
+    if binary_path.name.endswith(".exe"):
+        return parent / "llama-cli.exe"
+    return parent / "llama-cli"
+
+
+def _is_version_unrecognized(stderr: str, stdout: str) -> bool:
+    combined = (stderr + "\n" + stdout).lower()
+    mentions_version = "--version" in combined
+    has_rejection = any(p in combined for p in (
+        "invalid parameter",
+        "unrecognized option",
+        "invalid option",
+        "unknown option",
+        "not a valid",
+        "unsupported",
+    ))
+    return mentions_version and has_rejection
 
 
 def resolve_binary(
@@ -54,19 +89,62 @@ def resolve_binary(
     )
 
 
+def _parse_supported_flags_from_help(help_output: str) -> list[str]:
+    flags: list[str] = []
+    seen: set[str] = set()
+    for m in _HELP_OPTION_RE.finditer(help_output):
+        raw = m.group(1)
+        for part in raw.split(","):
+            part = part.strip()
+            if part and part not in seen:
+                seen.add(part)
+                flags.append(part)
+    if not flags:
+        raise ToolchainError(
+            "Could not parse any option aliases from llama-bench --help output.",
+        )
+    return flags
+
+
+def _parse_output_formats_from_help(help_output: str) -> list[str]:
+    m = _HELP_OUTPUT_FORMATS_RE.search(help_output)
+    if m is None:
+        return []
+    return [f.strip() for f in m.group(1).split("|")]
+
+
+def _parse_backends_from_help(help_output: str) -> list[str]:
+    combined = help_output.lower()
+    caps: list[str] = ["cpu"]
+    if "ggml_metal" in combined:
+        caps.append("metal")
+    if "cuda" in combined:
+        caps.append("cuda")
+    if "hip" in combined or "rocm" in combined:
+        caps.append("rocm")
+    return caps
+
+
 def inspect_toolchain(
     runner: ProcessRunner,
     binary_path: Path,
     help_output: str | None = None,
 ) -> ToolchainFingerprint:
-    version_output = _run_version(runner, binary_path)
+    version_output, is_fallback = _run_version(runner, binary_path)
     if help_output is None:
         help_output = _run_help(runner, binary_path)
 
-    version = _parse_version(version_output)
-    backends = _parse_backends(version_output)
-    output_formats = _parse_output_formats(version_output)
-    supported_flags = _parse_supported_flags(version_output)
+    if is_fallback:
+        cli_name = _sibling_cli_path(binary_path).name
+        version = _parse_version(version_output, label=cli_name)
+        backends = _parse_backends_from_help(help_output)
+        output_formats = _parse_output_formats_from_help(help_output)
+        supported_flags = _parse_supported_flags_from_help(help_output)
+    else:
+        version = _parse_version(version_output)
+        backends = _parse_backends(version_output)
+        output_formats = _parse_output_formats(version_output)
+        supported_flags = _parse_supported_flags(version_output)
     cache_types = _parse_cache_types(help_output, supported_flags)
 
     fp = ToolchainFingerprint(
@@ -83,16 +161,33 @@ def inspect_toolchain(
     return fp
 
 
-def _run_version(runner: ProcessRunner, binary_path: Path) -> str:
+def _run_version(runner: ProcessRunner, binary_path: Path) -> tuple[str, bool]:
     result = runner.run([str(binary_path), "--version"])
-    if result.returncode != 0:
+    if result.returncode == 0:
+        if not result.stdout.strip():
+            raise ToolchainError("llama-bench --version produced no output.")
+        return result.stdout, False
+
+    if not _is_version_unrecognized(result.stderr, result.stdout):
         raise ToolchainError(
             f"llama-bench --version exited with code {result.returncode}:\n"
             f"{result.stderr}",
         )
-    if not result.stdout.strip():
-        raise ToolchainError("llama-bench --version produced no output.")
-    return result.stdout
+
+    cli_path = _sibling_cli_path(binary_path)
+    cli_result = runner.run([str(cli_path), "--version"])
+    if cli_result.returncode != 0:
+        raise ToolchainError(
+            f"llama-bench --version unrecognized; fallback {cli_path.name} --version "
+            f"exited with code {cli_result.returncode}:\n"
+            f"{cli_result.stderr}",
+        )
+    cli_output = cli_result.stdout + "\n" + cli_result.stderr
+    if not cli_output.strip():
+        raise ToolchainError(
+            f"Fallback {cli_path.name} --version produced no output.",
+        )
+    return cli_output, True
 
 
 def _run_help(runner: ProcessRunner, binary_path: Path) -> str:
@@ -102,18 +197,19 @@ def _run_help(runner: ProcessRunner, binary_path: Path) -> str:
             f"llama-bench --help exited with code {result.returncode}:\n"
             f"{result.stderr}",
         )
-    if not result.stdout.strip():
+    combined = result.stdout + "\n" + result.stderr
+    if not combined.strip():
         raise ToolchainError(
             "llama-bench --help produced no output.",
         )
-    return result.stdout
+    return combined
 
 
-def _parse_version(output: str) -> str:
+def _parse_version(output: str, label: str = "llama-bench") -> str:
     m = VERSION_RE.search(output)
     if m is None:
         raise ToolchainError(
-            "Could not find 'version:' line in llama-bench --version output.\n"
+            f"Could not find 'version:' line in {label} --version output.\n"
             f"Output:\n{output}",
         )
     return m.group(1)

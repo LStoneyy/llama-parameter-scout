@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import threading
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol, cast, runtime_checkable
@@ -12,10 +13,11 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.message import Message
-from textual.screen import Screen
+from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     Button,
     Checkbox,
+    DirectoryTree,
     Footer,
     Header,
     Input,
@@ -30,6 +32,7 @@ from textual.worker import get_current_worker
 
 from .application import Application
 from .models import (
+    Accelerator,
     CandidateConfig,
     ExecutionPolicy,
     ModelFingerprint,
@@ -48,6 +51,7 @@ from .models import (
 )
 from .runner import ProcessRunner, ProductionRunner
 from .search import get_profile
+from .topology import DetectTopologyFn, detect_topology
 
 # ── Clipboard helpers ────────────────────────────────────────────
 
@@ -279,6 +283,8 @@ class ScoutTuiApp(App[None]):
     RichLog { border: solid $primary; margin: 1 2; }
     #clipboard-msg { text-align: center; padding: 0 2; }
     #error-screen { align: center middle; }
+    .browse-row { height: auto; margin: 0 2; }
+    .browse-row > Input { width: 1fr; }
     """
     BINDINGS = [
         Binding("ctrl+q", "quit", "Quit"),
@@ -294,6 +300,7 @@ class ScoutTuiApp(App[None]):
         runner_factory: Callable[[], ProcessRunner] | None = None,
         inspect_toolchain_fn: Callable[..., ToolchainFingerprint] | None = None,
         inspect_model_fn: Callable[..., ModelFingerprint] | None = None,
+        detect_topology_fn: DetectTopologyFn | None = None,
     ) -> None:
         super().__init__()
         self.wizard_state = WizardState()
@@ -303,6 +310,7 @@ class ScoutTuiApp(App[None]):
         self._runner_factory = runner_factory or (lambda: ProductionRunner())
         self._inspect_toolchain_fn = inspect_toolchain_fn
         self._inspect_model_fn = inspect_model_fn
+        self._detect_topology_fn = detect_topology_fn or detect_topology
 
     def on_mount(self) -> None:
         self.push_screen(WizardScreen())
@@ -338,6 +346,120 @@ class ErrorScreen(Screen[ScoutTuiApp]):
         self.app.exit()
 
 
+class _FilteredDirectoryTree(DirectoryTree):
+    """DirectoryTree with a configurable file filter."""
+
+    def __init__(
+        self, path: str, *, filter_fn: Callable[[Path], bool] | None = None, **kwargs: Any
+    ) -> None:
+        super().__init__(path, **kwargs)
+        self._filter_fn = filter_fn
+
+    def filter_paths(self, paths: Iterable[Path]) -> Iterable[Path]:
+        if self._filter_fn is None:
+            yield from paths
+            return
+        for p in paths:
+            if p.is_dir() or self._filter_fn(p):
+                yield p
+
+
+class GGUFDirectoryTree(_FilteredDirectoryTree):
+    """DirectoryTree that only shows .gguf files and directories."""
+
+    def __init__(self, path: str, **kwargs: Any) -> None:
+        super().__init__(path, filter_fn=lambda p: p.suffix.lower() == ".gguf", **kwargs)
+
+
+class _FileBrowser(ModalScreen[Path | None]):
+    """Generic modal file browser with configurable title, tree, and filter."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(
+        self,
+        title: str,
+        *,
+        root: Path | None = None,
+        tree_cls: type[DirectoryTree] = DirectoryTree,
+        is_valid: Callable[[Path], bool] | None = None,
+    ) -> None:
+        super().__init__()
+        self._title = title
+        self._root = root or Path.home()
+        self._tree_cls = tree_cls
+        self._is_valid = is_valid
+
+    def compose(self) -> ComposeResult:
+        yield Label(self._title)
+        yield self._tree_cls(str(self._root), id="file_tree")
+        yield Horizontal(
+            Button("Cancel", id="cancel_btn", variant="default"),
+            classes="button-row",
+        )
+
+    @on(Button.Pressed, "#cancel_btn")
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(DirectoryTree.FileSelected)
+    def _on_file_selected(self, event: DirectoryTree.FileSelected) -> None:
+        path = Path(event.path)
+        if path.is_file() and (self._is_valid is None or self._is_valid(path)):
+            self.dismiss(path)
+
+
+class ModelFileBrowser(_FileBrowser):
+    """Modal browser for .gguf model files."""
+
+    def __init__(self, root: Path | None = None) -> None:
+        super().__init__(
+            "Select a .gguf model file:",
+            root=root,
+            tree_cls=GGUFDirectoryTree,
+            is_valid=lambda p: p.suffix.lower() == ".gguf",
+        )
+
+
+class _BenchFileBrowser(_FileBrowser):
+    """Browser for selecting any regular file (e.g. llama-bench binary)."""
+
+    def __init__(self) -> None:
+        super().__init__("Select llama-bench binary:")
+
+
+class _JournalDirectoryTree(_FilteredDirectoryTree):
+    """DirectoryTree that only shows .json files."""
+
+    def __init__(self, path: str, **kwargs: Any) -> None:
+        super().__init__(path, filter_fn=lambda p: p.suffix.lower() == ".json", **kwargs)
+
+
+class _JournalFileBrowser(_FileBrowser):
+    """Browser for selecting .json journal files."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Select a .json journal file:",
+            tree_cls=_JournalDirectoryTree,
+            is_valid=lambda p: p.suffix.lower() == ".json",
+        )
+
+
+class DeviceDetected(Message):
+    def __init__(self, accelerators: tuple[Accelerator, ...]) -> None:
+        super().__init__()
+        self.accelerators = accelerators
+
+
+class DeviceDetectionFailed(Message):
+    def __init__(self, reason: str) -> None:
+        super().__init__()
+        self.reason = reason
+
+
 class PrepareDone(Message):
     def __init__(self, prepared: PreparedSession) -> None:
         super().__init__()
@@ -368,32 +490,62 @@ class WizardScreen(Screen[ScoutTuiApp]):
             yield Label("-- llama-parameter-scout Wizard --", id="wizard-title")
             yield Label("Binary & Model", classes="section-title")
             yield Label("llama-bench path")
-            yield Input(placeholder="/path/to/llama-bench", id="llama_bench_path")
+            yield Horizontal(
+                Input(placeholder="/path/to/llama-bench", id="llama_bench_path"),
+                Button("Browse", id="browse_bench_btn"),
+                classes="browse-row",
+            )
             yield Label("Model path")
-            yield Input(placeholder="/path/to/model.gguf", id="model_path")
+            yield Horizontal(
+                Input(placeholder="/path/to/model.gguf", id="model_path"),
+                Button("Browse", id="browse_model_btn"),
+                classes="browse-row",
+            )
             yield Label("Journal path")
-            yield Input(placeholder="/path/to/journal.json", id="journal_path")
+            yield Horizontal(
+                Input(placeholder="/path/to/journal.json", id="journal_path"),
+                Button("Browse", id="browse_journal_btn"),
+                classes="browse-row",
+            )
 
             yield Label("MTP (Multi-Token Prediction)", classes="section-title")
             yield Checkbox("Enable MTP", id="mtp_enabled")
             yield Label("Draft model path", id="lbl_draft_model_path")
-            yield Input(placeholder="/path/to/draft.gguf", id="draft_model_path")
+            yield Horizontal(
+                Input(placeholder="/path/to/draft.gguf", id="draft_model_path"),
+                Button("Browse", id="browse_draft_btn"),
+                classes="browse-row",
+                id="draft_model_row",
+            )
             yield Label("llama-server path", id="lbl_server_path")
             yield Input(placeholder="/path/to/llama-server", id="server_path")
 
             yield Label("Device", classes="section-title")
-            yield Checkbox("CPU-only", id="cpu_only", value=True)
-            yield Label("Device ID (when not CPU-only)")
-            yield Input(placeholder="0", id="device_id")
+            yield Label("Detecting...", id="device_status")
+            yield Select(
+                [("CPU-only", "cpu_only")],
+                prompt="Device",
+                value="cpu_only",
+                allow_blank=False,
+                id="device",
+            )
 
             yield Label("Context", classes="section-title")
-            yield Label("n_ctx total")
+            yield Select(
+                [(str(n), str(n)) for n in (2048, 4096, 8192, 16384, 32768)]
+                + [("custom", "custom")],
+                prompt="Context preset",
+                value="2048",
+                allow_blank=False,
+                id="context_preset",
+            )
+            yield Label("n_ctx total", id="lbl_n_ctx_total")
             yield Input(value="2048", id="n_ctx_total")
-            yield Label("n_ctx prompt")
+            yield Label("n_ctx prompt", id="lbl_n_ctx_prompt")
             yield Input(value="512", id="n_ctx_prompt")
-            yield Label("n_ctx generation")
+            yield Label("n_ctx generation", id="lbl_n_ctx_generation")
             yield Input(value="1024", id="n_ctx_generation")
-            yield Label("n_ctx depth")
+            yield Label("n_ctx depth", id="lbl_n_ctx_depth")
             yield Input(value="512", id="n_ctx_depth")
             yield Checkbox("Acknowledge context risk", id="acknowledged")
 
@@ -429,6 +581,7 @@ class WizardScreen(Screen[ScoutTuiApp]):
     def on_mount(self) -> None:
         self._populate_from_state()
         self._update_mtp_visibility()
+        self._detect_devices()
 
     def _populate_from_state(self) -> None:
         state = self._tui.wizard_state
@@ -437,8 +590,6 @@ class WizardScreen(Screen[ScoutTuiApp]):
         self.query_one("#journal_path", Input).value = state.journal_path
         self.query_one("#draft_model_path", Input).value = state.draft_model_path
         self.query_one("#server_path", Input).value = state.server_path
-        self.query_one("#cpu_only", Checkbox).value = state.cpu_only
-        self.query_one("#device_id", Input).value = state.device_id
         self.query_one("#n_ctx_total", Input).value = state.n_ctx_total
         self.query_one("#n_ctx_prompt", Input).value = state.n_ctx_prompt
         self.query_one("#n_ctx_generation", Input).value = state.n_ctx_generation
@@ -448,19 +599,162 @@ class WizardScreen(Screen[ScoutTuiApp]):
         self.query_one("#budget_vram", Input).value = state.budget_vram
         self.query_one("#headroom_ratio", Input).value = state.headroom_ratio
         self.query_one("#mtp_enabled", Checkbox).value = state.mtp_enabled
+        self._restore_context_preset()
+
+    def _restore_context_preset(self) -> None:
+        state = self._tui.wizard_state
+        presets = [2048, 4096, 8192, 16384, 32768]
+        try:
+            total = int(state.n_ctx_total)
+            prompt = int(state.n_ctx_prompt)
+            gen = int(state.n_ctx_generation)
+            depth = int(state.n_ctx_depth)
+        except ValueError:
+            self.query_one("#context_preset", Select).value = "custom"
+            self._show_context_custom_fields()
+            return
+        for p in presets:
+            expected_prompt = p // 4
+            expected_gen = p // 2
+            expected_depth = p - expected_prompt - expected_gen
+            if (total == p and prompt == expected_prompt
+                    and gen == expected_gen and depth == expected_depth):
+                self.query_one("#context_preset", Select).value = str(p)
+                self._hide_context_custom_fields()
+                return
+        self.query_one("#context_preset", Select).value = "custom"
+        self._show_context_custom_fields()
 
     def _update_mtp_visibility(self) -> None:
         mtp_on = self.query_one("#mtp_enabled", Checkbox).value
-        for lbl_id, inp_id in (
-            ("lbl_draft_model_path", "draft_model_path"),
-            ("lbl_server_path", "server_path"),
-        ):
-            self.query_one(f"#{lbl_id}", Label).display = mtp_on
-            self.query_one(f"#{inp_id}", Input).display = mtp_on
+        self.query_one("#lbl_draft_model_path", Label).display = mtp_on
+        self.query_one("#draft_model_row", Horizontal).display = mtp_on
+        self.query_one("#lbl_server_path", Label).display = mtp_on
+        self.query_one("#server_path", Input).display = mtp_on
 
     @on(Checkbox.Changed, "#mtp_enabled")
     def _on_mtp_toggle(self) -> None:
         self._update_mtp_visibility()
+
+    @on(Button.Pressed, "#browse_model_btn")
+    def _open_model_browser(self) -> None:
+        def on_select(path: Path | None) -> None:
+            if path is not None:
+                self.query_one("#model_path", Input).value = str(path)
+        self.app.push_screen(ModelFileBrowser(), on_select)
+
+    @on(Button.Pressed, "#browse_draft_btn")
+    def _open_draft_browser(self) -> None:
+        def on_select(path: Path | None) -> None:
+            if path is not None:
+                self.query_one("#draft_model_path", Input).value = str(path)
+        self.app.push_screen(ModelFileBrowser(), on_select)
+
+    @on(Button.Pressed, "#browse_bench_btn")
+    def _open_bench_browser(self) -> None:
+        def on_select(path: Path | None) -> None:
+            if path is not None:
+                self.query_one("#llama_bench_path", Input).value = str(path)
+        self.app.push_screen(_BenchFileBrowser(), on_select)
+
+    @on(Button.Pressed, "#browse_journal_btn")
+    def _open_journal_browser(self) -> None:
+        def on_select(path: Path | None) -> None:
+            if path is not None:
+                self.query_one("#journal_path", Input).value = str(path)
+        self.app.push_screen(_JournalFileBrowser(), on_select)
+
+    @work(thread=True)
+    def _detect_devices(self) -> None:
+        tui = self._tui
+        worker = get_current_worker()
+        try:
+            topology = tui._detect_topology_fn()
+            if worker.is_cancelled:
+                return
+            self.post_message(DeviceDetected(topology.accelerators))
+        except Exception as e:
+            if worker.is_cancelled:
+                return
+            self.post_message(DeviceDetectionFailed(str(e)))
+
+    @on(DeviceDetected)
+    def _on_devices_detected(self, message: DeviceDetected) -> None:
+        accels = message.accelerators
+        select = self.query_one("#device", Select)
+        options: list[tuple[str, str]] = [("CPU-only", "cpu_only")]
+        for a in accels:
+            label = f"{a.description} (id={a.device_id}, {a.backend})"
+            options.append((label, f"gpu:{a.device_id}"))
+        select.set_options(options)
+        state = self._tui.wizard_state
+        restored = False
+        if not state.cpu_only and state.device_id:
+            prev_val = f"gpu:{state.device_id}"
+            if any(v == prev_val for _, v in options):
+                select.value = prev_val
+                restored = True
+        if not restored:
+            select.value = "cpu_only"
+        if not accels:
+            self.query_one("#device_status", Label).update(
+                "No accelerators detected"
+            )
+        else:
+            n = len(accels)
+            label = f"{n} accelerator(s) detected"
+            self.query_one("#device_status", Label).update(label)
+
+    @on(DeviceDetectionFailed)
+    def _on_devices_failed(self, message: DeviceDetectionFailed) -> None:
+        self.query_one("#device_status", Label).update(
+            f"Detection: {message.reason}"
+        )
+
+    @on(Select.Changed, "#context_preset")
+    def _on_context_preset_changed(self, event: Select.Changed) -> None:
+        value = event.value
+        if not isinstance(value, str):
+            return
+        if value == "custom":
+            self._show_context_custom_fields()
+        else:
+            try:
+                total = int(value)
+            except (ValueError, TypeError):
+                return
+            prompt = total // 4
+            gen = total // 2
+            depth = total - prompt - gen
+            self.query_one("#n_ctx_total", Input).value = str(total)
+            self.query_one("#n_ctx_prompt", Input).value = str(prompt)
+            self.query_one("#n_ctx_generation", Input).value = str(gen)
+            self.query_one("#n_ctx_depth", Input).value = str(depth)
+            self._hide_context_custom_fields()
+
+    def _show_context_custom_fields(self) -> None:
+        for lbl_id in (
+            "lbl_n_ctx_total", "lbl_n_ctx_prompt",
+            "lbl_n_ctx_generation", "lbl_n_ctx_depth",
+        ):
+            self.query_one(f"#{lbl_id}", Label).display = True
+        for inp_id in (
+            "n_ctx_total", "n_ctx_prompt",
+            "n_ctx_generation", "n_ctx_depth",
+        ):
+            self.query_one(f"#{inp_id}", Input).display = True
+
+    def _hide_context_custom_fields(self) -> None:
+        for lbl_id in (
+            "lbl_n_ctx_total", "lbl_n_ctx_prompt",
+            "lbl_n_ctx_generation", "lbl_n_ctx_depth",
+        ):
+            self.query_one(f"#{lbl_id}", Label).display = False
+        for inp_id in (
+            "n_ctx_total", "n_ctx_prompt",
+            "n_ctx_generation", "n_ctx_depth",
+        ):
+            self.query_one(f"#{inp_id}", Input).display = False
 
     def action_next_screen(self) -> None:
         self._do_next()
@@ -491,8 +785,13 @@ class WizardScreen(Screen[ScoutTuiApp]):
         state.journal_path = self.query_one("#journal_path", Input).value.strip()
         state.draft_model_path = self.query_one("#draft_model_path", Input).value.strip()
         state.server_path = self.query_one("#server_path", Input).value.strip()
-        state.cpu_only = self.query_one("#cpu_only", Checkbox).value
-        state.device_id = self.query_one("#device_id", Input).value.strip()
+        device_val = self.query_one("#device", Select).value
+        if isinstance(device_val, str) and device_val.startswith("gpu:"):
+            state.cpu_only = False
+            state.device_id = device_val.removeprefix("gpu:")
+        else:
+            state.cpu_only = True
+            state.device_id = ""
         state.n_ctx_total = self.query_one("#n_ctx_total", Input).value.strip()
         state.n_ctx_prompt = self.query_one("#n_ctx_prompt", Input).value.strip()
         state.n_ctx_generation = self.query_one("#n_ctx_generation", Input).value.strip()

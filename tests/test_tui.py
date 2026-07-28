@@ -4,7 +4,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from textual.widgets import Checkbox, Input, Label, RichLog, TabbedContent
+from textual.widgets import DirectoryTree, Input, Label, RichLog, Select, TabbedContent
 
 from llama_parameter_scout.models import (
     Accelerator,
@@ -33,6 +33,8 @@ from llama_parameter_scout.runner import FakeRunner
 from llama_parameter_scout.search import QUICK_PROFILE
 from llama_parameter_scout.tui import (
     ErrorScreen,
+    GGUFDirectoryTree,
+    ModelFileBrowser,
     PreparedSession,
     ProgressScreen,
     ResultsScreen,
@@ -42,6 +44,7 @@ from llama_parameter_scout.tui import (
     RunProgress,
     ScoutTuiApp,
     WizardScreen,
+    _FileBrowser,
 )
 
 
@@ -65,6 +68,19 @@ _SAMPLE_TOPO = SystemTopology(
                               description="Apple M1", memory_bytes=17179869184),),
     memory_unified=True,
 )
+
+_NO_DEVICE_TOPO = SystemTopology(
+    cpu_count=8, system_memory_bytes=17179869184,
+    accelerators=(), memory_unified=True,
+)
+
+
+def _fake_detect_with_devices() -> SystemTopology:
+    return _SAMPLE_TOPO
+
+
+def _fake_detect_no_devices() -> SystemTopology:
+    return _NO_DEVICE_TOPO
 
 
 def _make_model() -> ModelFingerprint:
@@ -236,7 +252,7 @@ async def test_wizard_mtp_fields_hidden_by_default() -> None:
     app = ScoutTuiApp()
     async with app.run_test() as pilot:
         await pilot.pause()
-        assert not app.screen.query_one("#draft_model_path").display
+        assert not app.screen.query_one("#draft_model_row").display
         assert not app.screen.query_one("#server_path").display
 
 
@@ -246,7 +262,7 @@ async def test_wizard_mtp_toggle_shows_fields() -> None:
         await pilot.pause()
         await pilot.click("#mtp_enabled")
         await pilot.pause()
-        assert app.screen.query_one("#draft_model_path").display
+        assert app.screen.query_one("#draft_model_row").display
         assert app.screen.query_one("#server_path").display
 
 
@@ -307,18 +323,390 @@ async def test_wizard_quit_button_exits(monkeypatch: Any) -> None:
         assert len(exit_calls) == 1
 
 
-async def test_wizard_validation_device_id_integer() -> None:
+# ── Device detection tests ──────────────────────────────────────
+
+
+async def test_wizard_device_detection_shows_accelerators(tmp_path: Path) -> None:
+    app = ScoutTuiApp(detect_topology_fn=_fake_detect_with_devices)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        for _ in range(50):
+            await pilot.pause()
+            status = _text(app.screen.query_one("#device_status"))
+            if "accelerator" in status.lower() or "detected" in status.lower():
+                break
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        status = _text(app.screen.query_one("#device_status"))
+        assert "accelerator" in status or "detected" in status
+        ws.query_one("#device", Select).value = "gpu:0"
+        ws.query_one("#llama_bench_path", Input).value = "/tmp/llama-bench"
+        ws.query_one("#model_path", Input).value = "/tmp/model.gguf"
+        ws.query_one("#journal_path", Input).value = "/tmp/j.json"
+        ws._gather_and_validate()
+        assert not app.wizard_state.cpu_only
+        assert app.wizard_state.device_id == "0"
+
+
+async def test_wizard_device_detection_no_devices() -> None:
+    app = ScoutTuiApp(detect_topology_fn=_fake_detect_no_devices)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        for _ in range(50):
+            await pilot.pause()
+            status = _text(app.screen.query_one("#device_status"))
+            if "accelerator" in status.lower() or "No" in status:
+                break
+        status = _text(app.screen.query_one("#device_status"))
+        assert "No accelerators" in status
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        ws.query_one("#device", Select).value = "cpu_only"
+        ws.query_one("#llama_bench_path", Input).value = "/tmp/llama-bench"
+        ws.query_one("#model_path", Input).value = "/tmp/model.gguf"
+        ws.query_one("#journal_path", Input).value = "/tmp/j.json"
+        ws._gather_and_validate()
+        assert app.wizard_state.cpu_only
+        assert app.wizard_state.device_id == ""
+
+
+async def test_wizard_device_detection_failure() -> None:
+    def _fail() -> SystemTopology:
+        raise RuntimeError("Probing failed")
+
+    app = ScoutTuiApp(detect_topology_fn=_fail)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        for _ in range(50):
+            await pilot.pause()
+            status = _text(app.screen.query_one("#device_status"))
+            if "Detection" in status or "Detecting" not in status:
+                break
+        status = _text(app.screen.query_one("#device_status"))
+        assert "Detection" in status
+
+
+# ── Model file browser tests ────────────────────────────────────
+
+
+async def test_model_file_browser_root_home() -> None:
+    browser = ModelFileBrowser()
+    assert browser._root == Path.home()
+
+
+async def test_model_file_browser_custom_root(tmp_path: Path) -> None:
+    browser = ModelFileBrowser(root=tmp_path)
+    assert browser._root == tmp_path
+
+
+async def test_model_file_browser_filters_non_gguf(tmp_path: Path) -> None:
+    app = ScoutTuiApp()
+    async with app.run_test() as pilot:
+        browser = ModelFileBrowser(root=tmp_path)
+        app.push_screen(browser)
+        await pilot.pause()
+
+        txt_file = tmp_path / "data.txt"
+        txt_file.write_text("")
+        gguf_file = tmp_path / "model.gguf"
+        gguf_file.write_text("")
+
+        tree = browser.query_one(GGUFDirectoryTree)
+        filtered = list(tree.filter_paths([txt_file, gguf_file, tmp_path]))
+        assert txt_file not in filtered
+        assert gguf_file in filtered
+        assert tmp_path in filtered
+
+
+async def test_model_file_browser_select_gguf_callback(tmp_path: Path) -> None:
+    gguf = tmp_path / "model.gguf"
+    gguf.write_text("")
+    selected: list[Path] = []
+    app = ScoutTuiApp()
+    async with app.run_test() as pilot:
+        browser = ModelFileBrowser(root=tmp_path)
+        app.push_screen(browser, lambda p: selected.append(p) if p else None)
+        await pilot.pause()
+        browser._on_file_selected(
+            type("_E", (), {"path": gguf})()
+        )
+        await pilot.pause()
+        assert len(selected) == 1
+        assert selected[0] == gguf
+
+
+async def test_model_file_browser_select_non_gguf_noop(tmp_path: Path) -> None:
+    txt = tmp_path / "data.txt"
+    txt.write_text("")
+    selected: list[Path] = []
+    app = ScoutTuiApp()
+    async with app.run_test() as pilot:
+        browser = ModelFileBrowser(root=tmp_path)
+        app.push_screen(browser, lambda p: selected.append(p) if p else None)
+        await pilot.pause()
+        browser._on_file_selected(
+            type("_E", (), {"path": txt})()
+        )
+        await pilot.pause()
+        assert len(selected) == 0
+
+
+async def test_wizard_browse_model_populates_input(tmp_path: Path) -> None:
+    gguf = tmp_path / "model.gguf"
+    gguf.write_text("")
     app = ScoutTuiApp()
     async with app.run_test() as pilot:
         await pilot.pause()
         ws = app.screen
         assert isinstance(ws, WizardScreen)
-        ws.query_one("#cpu_only", Checkbox).value = False
-        ws.query_one("#device_id", Input).value = "abc"
+        ws._open_model_browser()
+        await pilot.pause()
+        assert isinstance(app.screen, ModelFileBrowser)
+        app.screen._on_file_selected(type("_E", (), {"path": gguf})())
+        await pilot.pause()
+        assert isinstance(app.screen, WizardScreen)
+        assert ws.query_one("#model_path", Input).value == str(gguf)
+
+
+async def test_browser_escape_cancel_returns_without_selection(tmp_path: Path) -> None:
+    gguf = tmp_path / "model.gguf"
+    gguf.write_text("")
+    app = ScoutTuiApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        initial = ws.query_one("#model_path", Input).value
+        ws._open_model_browser()
+        await pilot.pause()
+        assert isinstance(app.screen, ModelFileBrowser)
+        app.screen.action_cancel()
+        await pilot.pause()
+        assert isinstance(app.screen, WizardScreen)
+        assert ws.query_one("#model_path", Input).value == initial
+
+
+async def test_browser_cancel_button_returns_without_selection(tmp_path: Path) -> None:
+    gguf = tmp_path / "model.gguf"
+    gguf.write_text("")
+    app = ScoutTuiApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        initial = ws.query_one("#model_path", Input).value
+        ws._open_model_browser()
+        await pilot.pause()
+        assert isinstance(app.screen, ModelFileBrowser)
+        await pilot.click("#cancel_btn")
+        await pilot.pause()
+        assert isinstance(app.screen, WizardScreen)
+        assert ws.query_one("#model_path", Input).value == initial
+
+
+# ── llama-bench and journal browse tests ──────────────────────────
+
+
+async def test_wizard_browse_bench_populates_input(tmp_path: Path) -> None:
+    bench = tmp_path / "my-llama-bench"
+    bench.write_text("")
+    app = ScoutTuiApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        ws._open_bench_browser()
+        await pilot.pause()
+        assert isinstance(app.screen, _FileBrowser)
+        app.screen._on_file_selected(type("_E", (), {"path": bench})())
+        await pilot.pause()
+        assert isinstance(app.screen, WizardScreen)
+        assert ws.query_one("#llama_bench_path", Input).value == str(bench)
+
+
+async def test_wizard_browse_journal_populates_input(tmp_path: Path) -> None:
+    jfile = tmp_path / "journal.json"
+    jfile.write_text("")
+    app = ScoutTuiApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        ws._open_journal_browser()
+        await pilot.pause()
+        assert isinstance(app.screen, _FileBrowser)
+        app.screen._on_file_selected(type("_E", (), {"path": jfile})())
+        await pilot.pause()
+        assert isinstance(app.screen, WizardScreen)
+        assert ws.query_one("#journal_path", Input).value == str(jfile)
+
+
+async def test_wizard_browse_journal_select_non_json_noop(tmp_path: Path) -> None:
+    txt = tmp_path / "data.txt"
+    txt.write_text("")
+    app = ScoutTuiApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        initial = ws.query_one("#journal_path", Input).value
+        ws._open_journal_browser()
+        await pilot.pause()
+        assert isinstance(app.screen, _FileBrowser)
+        app.screen._on_file_selected(type("_E", (), {"path": txt})())
+        await pilot.pause()
+        # Browser stays open (no dismiss) — input unchanged
+        assert not isinstance(app.screen, WizardScreen)
+        assert isinstance(app.screen, _FileBrowser)
+        app.screen.action_cancel()
+        await pilot.pause()
+        assert isinstance(app.screen, WizardScreen)
+        assert ws.query_one("#journal_path", Input).value == initial
+
+
+async def test_wizard_browse_journal_filters_non_json(tmp_path: Path) -> None:
+    app = ScoutTuiApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        ws._open_journal_browser()
+        await pilot.pause()
+        assert isinstance(app.screen, _FileBrowser)
+        tree = app.screen.query_one("#file_tree", DirectoryTree)
+        txt = tmp_path / "data.txt"
+        txt.write_text("")
+        json_lower = tmp_path / "data.json"
+        json_lower.write_text("")
+        json_upper = tmp_path / "data.JSON"
+        json_upper.write_text("")
+        filtered = list(tree.filter_paths([txt, json_lower, json_upper, tmp_path]))
+        assert txt not in filtered
+        assert json_lower in filtered
+        assert json_upper in filtered
+        assert tmp_path in filtered
+
+
+async def test_wizard_browse_journal_cancel_leaves_input_unchanged(tmp_path: Path) -> None:
+    app = ScoutTuiApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        initial = ws.query_one("#journal_path", Input).value
+        ws._open_journal_browser()
+        await pilot.pause()
+        assert isinstance(app.screen, _FileBrowser)
+        app.screen.action_cancel()
+        await pilot.pause()
+        assert isinstance(app.screen, WizardScreen)
+        assert ws.query_one("#journal_path", Input).value == initial
+
+
+async def test_device_select_stays_cpu_only_after_no_device_detection() -> None:
+    app = ScoutTuiApp(detect_topology_fn=_fake_detect_no_devices)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        for _ in range(50):
+            await pilot.pause()
+            status = _text(app.screen.query_one("#device_status"))
+            if "No accelerators" in status or "Detecting" not in status:
+                break
+        select = app.screen.query_one("#device", Select)
+        assert select.value == "cpu_only"
+
+
+async def test_device_select_stays_cpu_only_after_detection_with_devices() -> None:
+    app = ScoutTuiApp(detect_topology_fn=_fake_detect_with_devices)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        for _ in range(50):
+            await pilot.pause()
+            status = _text(app.screen.query_one("#device_status"))
+            if "accelerator" in status.lower() or "detected" in status.lower():
+                break
+        select = app.screen.query_one("#device", Select)
+        assert select.value == "cpu_only"
+
+
+# ── Context preset tests ────────────────────────────────────────
+
+
+async def test_wizard_context_preset_updates_values() -> None:
+    app = ScoutTuiApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        ws.query_one("#context_preset", Select).value = "4096"
+        await pilot.pause()
+        assert ws.query_one("#n_ctx_total", Input).value == "4096"
+        assert ws.query_one("#n_ctx_prompt", Input).value == "1024"
+        assert ws.query_one("#n_ctx_generation", Input).value == "2048"
+        assert ws.query_one("#n_ctx_depth", Input).value == "1024"
+
+
+async def test_wizard_context_preset_hides_custom_fields() -> None:
+    app = ScoutTuiApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        assert not ws.query_one("#lbl_n_ctx_total").display
+        ws.query_one("#context_preset", Select).value = "custom"
+        await pilot.pause()
+        assert ws.query_one("#lbl_n_ctx_total").display
+        assert ws.query_one("#n_ctx_total", Input).display
+        ws.query_one("#context_preset", Select).value = "8192"
+        await pilot.pause()
+        assert not ws.query_one("#lbl_n_ctx_total").display
+
+
+async def test_wizard_context_preset_bad_sum_still_validated() -> None:
+    app = ScoutTuiApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        ws.query_one("#context_preset", Select).value = "custom"
+        await pilot.pause()
+        ws.query_one("#n_ctx_total", Input).value = "500"
+        ws.query_one("#n_ctx_prompt", Input).value = "600"
+        ws.query_one("#n_ctx_generation", Input).value = "10"
+        ws.query_one("#n_ctx_depth", Input).value = "10"
         ws.action_next_screen()
         await pilot.pause()
-        text = _text(ws.query_one("#wizard_errors"))
-        assert "Device ID must be an integer" in text
+        assert "do not sum to total" in _text(ws.query_one("#wizard_errors"))
+
+
+async def test_wizard_context_preset_restores_from_state() -> None:
+    app = ScoutTuiApp()
+    state = app.wizard_state
+    state.n_ctx_total = "8192"
+    state.n_ctx_prompt = "2048"
+    state.n_ctx_generation = "4096"
+    state.n_ctx_depth = "2048"
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        assert ws.query_one("#context_preset", Select).value == "8192"
+        assert not ws.query_one("#lbl_n_ctx_total").display
+
+
+async def test_wizard_context_preset_restores_custom() -> None:
+    app = ScoutTuiApp()
+    state = app.wizard_state
+    state.n_ctx_total = "3000"
+    state.n_ctx_prompt = "1000"
+    state.n_ctx_generation = "1500"
+    state.n_ctx_depth = "500"
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        ws = app.screen
+        assert isinstance(ws, WizardScreen)
+        assert ws.query_one("#context_preset", Select).value == "custom"
+        assert ws.query_one("#lbl_n_ctx_total").display
 
 
 # ── Review screen ───────────────────────────────────────────────
@@ -386,6 +774,7 @@ async def test_end_to_end_full_flow(tmp_path: Path) -> None:
     fa = FakeApp()
     app = ScoutTuiApp(
         app_factory=lambda r: fa, runner_factory=lambda: FakeRunner(),
+        detect_topology_fn=_fake_detect_no_devices,
         **_tui_kw(),
     )
     async with app.run_test() as pilot:
@@ -431,6 +820,7 @@ async def test_end_to_end_with_mtp(tmp_path: Path) -> None:
     fa = FakeApp()
     app = ScoutTuiApp(
         app_factory=lambda r: fa, runner_factory=lambda: FakeRunner(),
+        detect_topology_fn=_fake_detect_no_devices,
         **_tui_kw(),
     )
     async with app.run_test() as pilot:
@@ -474,6 +864,7 @@ async def test_cancellation_during_screening(tmp_path: Path) -> None:
     fa.screening_began = threading.Event()
     app = ScoutTuiApp(
         app_factory=lambda r: fa, runner_factory=lambda: FakeRunner(),
+        detect_topology_fn=_fake_detect_no_devices,
         **_tui_kw(),
     )
     async with app.run_test() as pilot:
@@ -755,7 +1146,7 @@ async def test_error_screen_back_button() -> None:
 
 
 async def test_keyboard_f10_advances(tmp_path: Path) -> None:
-    app = ScoutTuiApp()
+    app = ScoutTuiApp(detect_topology_fn=_fake_detect_no_devices)
     async with app.run_test() as pilot:
         await pilot.pause()
         ws = app.screen
