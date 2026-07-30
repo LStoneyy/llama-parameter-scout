@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import io
 import struct
 from pathlib import Path
 
 import pytest
 
 from llama_parameter_scout.model_inspector import (
+    _GGUFReadBudget,
     _has_symlink_ancestor,
     _is_url,
+    _parse_gguf,
     _read_gguf_metadata,
     inspect_model,
     set_network_mount_checker,
@@ -474,3 +477,184 @@ def _pack_gguf_string_raw(buf: bytearray, s: str) -> None:
     encoded = s.encode("utf-8")
     buf.extend(struct.pack("<Q", len(encoded)))
     buf.extend(encoded)
+
+
+class TestGgufReadBudget:
+    """Budget enforcement for GGUF metadata parsing."""
+
+    # -- wire byte budget -----------------------------------------------
+
+    def test_byte_budget_exact(self, tmp_path: Path) -> None:
+        p = tmp_path / "model.gguf"
+        build_gguf(p, {})
+        meta = _read_gguf_metadata(p, _budget=_GGUFReadBudget(wire_bytes=24, max_values=10))
+        assert meta == {}
+
+    def test_byte_budget_exceeded(self, tmp_path: Path) -> None:
+        p = tmp_path / "model.gguf"
+        build_gguf(p, {})
+        with pytest.raises(ModelRejectedError, match="Metadata byte budget exceeded"):
+            _read_gguf_metadata(p, _budget=_GGUFReadBudget(wire_bytes=23, max_values=10))
+
+    # -- cumulative element (value) budget ------------------------------
+
+    def test_element_budget_scalar(self, tmp_path: Path) -> None:
+        p = tmp_path / "model.gguf"
+        build_gguf(p, {"a": (0, 1), "b": (0, 2)})
+        meta = _read_gguf_metadata(p, _budget=_GGUFReadBudget(wire_bytes=200, max_values=4))
+        assert meta == {"a": 1, "b": 2}
+
+    def test_element_budget_scalar_exceeded(self, tmp_path: Path) -> None:
+        p = tmp_path / "model.gguf"
+        build_gguf(p, {"a": (0, 1), "b": (0, 2)})
+        with pytest.raises(ModelRejectedError, match="Metadata element budget exceeded"):
+            _read_gguf_metadata(p, _budget=_GGUFReadBudget(wire_bytes=200, max_values=3))
+
+    def test_element_budget_nested_arrays(self, tmp_path: Path) -> None:
+        p = tmp_path / "model.gguf"
+        build_gguf(p, {"arr": (9, (9, [(5, [42]), (5, [99])]))})
+        meta = _read_gguf_metadata(
+            p, _budget=_GGUFReadBudget(wire_bytes=500, max_values=6, max_array_nesting=5),
+        )
+        assert meta == {"arr": [[42], [99]]}
+
+    def test_element_budget_nested_arrays_exceeded(self, tmp_path: Path) -> None:
+        p = tmp_path / "model.gguf"
+        build_gguf(p, {"arr": (9, (9, [(5, [42]), (5, [99])]))})
+        with pytest.raises(ModelRejectedError, match="Metadata element budget exceeded"):
+            _read_gguf_metadata(
+                p, _budget=_GGUFReadBudget(wire_bytes=500, max_values=5, max_array_nesting=5),
+            )
+
+    # -- single-array length limit --------------------------------------
+
+    def test_array_length_exact(self, tmp_path: Path) -> None:
+        p = tmp_path / "model.gguf"
+        build_gguf(p, {"arr": (9, (5, [1, 2, 3]))})
+        meta = _read_gguf_metadata(
+            p, _budget=_GGUFReadBudget(max_array_length=3, wire_bytes=500, max_values=10),
+        )
+        assert meta == {"arr": [1, 2, 3]}
+
+    def test_array_length_exceeded(self, tmp_path: Path) -> None:
+        p = tmp_path / "model.gguf"
+        build_gguf(p, {"arr": (9, (5, [1, 2, 3, 4]))})
+        with pytest.raises(
+            ModelRejectedError,
+            match=r"GGUF array length 4 exceeds maximum 3",
+        ):
+            _read_gguf_metadata(
+                p, _budget=_GGUFReadBudget(max_array_length=3, wire_bytes=500, max_values=10),
+            )
+
+    # -- array nesting depth --------------------------------------------
+
+    def test_nesting_exact(self, tmp_path: Path) -> None:
+        p = tmp_path / "model.gguf"
+        build_gguf(p, {"arr": (9, (9, [(5, [1])]))})
+        meta = _read_gguf_metadata(
+            p, _budget=_GGUFReadBudget(wire_bytes=500, max_values=10, max_array_nesting=2),
+        )
+        assert meta == {"arr": [[1]]}
+
+    def test_nesting_exceeded(self, tmp_path: Path) -> None:
+        p = tmp_path / "model.gguf"
+        build_gguf(p, {"arr": (9, (9, [(9, [(5, [1])])]))})
+        with pytest.raises(ModelRejectedError, match="Array nesting depth exceeded"):
+            _read_gguf_metadata(
+                p, _budget=_GGUFReadBudget(wire_bytes=500, max_values=10, max_array_nesting=2),
+            )
+
+    # -- stream-position proof: rejection before element read -----------
+
+    def test_array_element_not_read_when_budget_exceeded(self, tmp_path: Path) -> None:
+        """Verify enter_array preflight rejects before reading elements."""
+        p = tmp_path / "model.gguf"
+        build_gguf(p, {"arr": (9, (5, [10, 20, 30]))})
+        raw = p.read_bytes()
+
+        # Position breakdown for array-of-3-int32 metadata:
+        #   4 magic + 4 version + 8 tensor_count + 8 kv_count
+        # + 8 key_len + 3 "arr" + 4 value_type
+        # + 4 elem_type + 8 length
+        # = 51 (array element data starts at offset 51)
+        array_header_end = 51
+
+        # Success path: budget covers key + container + 3 elements = 5
+        stream = io.BytesIO(raw)
+        budget = _GGUFReadBudget(
+            wire_bytes=500, max_values=5, max_array_nesting=5,
+        )
+        meta = _parse_gguf(stream, p, budget)
+        assert meta == {"arr": [10, 20, 30]}
+
+        # Failure path: budget covers only key + container + 2 elements = 4
+        # enter_array (element_count=3, remaining=3) → 3 >= 3 → reject
+        stream = io.BytesIO(raw)
+        budget = _GGUFReadBudget(
+            wire_bytes=500, max_values=4, max_array_nesting=5,
+        )
+        with pytest.raises(ModelRejectedError, match="Metadata element budget exceeded"):
+            _parse_gguf(stream, p, budget)
+        assert stream.tell() == array_header_end, (
+            f"Stream advanced to {stream.tell()} (expected {array_header_end}); "
+            "an array element was read despite budget rejection"
+        )
+
+
+class TestShardPrefix:
+    """Verify glob.escape does not break special-char prefixes.
+    Each test places a decoy file whose filename the *unescaped* glob would
+    incorrectly match; the test passes only when the escaped glob ignores it.
+    """
+
+    def _build_shards(self, tmp_path: Path, prefix: str, total: int) -> Path:
+        primary: Path | None = None
+        for i in range(1, total + 1):
+            name = f"{prefix}-{i:05d}-of-{total:05d}.gguf"
+            shard = tmp_path / name
+            build_gguf(shard, {"general.architecture": (8, "llama")})
+            if i == 1:
+                primary = shard
+        assert primary is not None
+        return primary
+
+    def test_prefix_with_star(self, tmp_path: Path) -> None:
+        primary = self._build_shards(tmp_path, "my*-model", 3)
+        decoy = tmp_path / "myX-model-00001-of-00003.gguf"
+        build_gguf(decoy, {"general.architecture": (8, "llama")})
+        fp = inspect_model(primary)
+        assert fp.architecture == "llama"
+        assert len(fp.shards) == 3
+
+    def test_prefix_with_question(self, tmp_path: Path) -> None:
+        primary = self._build_shards(tmp_path, "my?-model", 3)
+        decoy = tmp_path / "myX-model-00001-of-00003.gguf"
+        build_gguf(decoy, {"general.architecture": (8, "llama")})
+        fp = inspect_model(primary)
+        assert fp.architecture == "llama"
+        assert len(fp.shards) == 3
+
+    def test_prefix_with_bracket_open(self, tmp_path: Path) -> None:
+        primary = self._build_shards(tmp_path, "my[-model", 3)
+        decoy = tmp_path / "myX-model-00001-of-00003.gguf"
+        build_gguf(decoy, {"general.architecture": (8, "llama")})
+        fp = inspect_model(primary)
+        assert fp.architecture == "llama"
+        assert len(fp.shards) == 3
+
+    def test_prefix_with_bracket_close(self, tmp_path: Path) -> None:
+        primary = self._build_shards(tmp_path, "my]-model", 3)
+        decoy = tmp_path / "myX-model-00001-of-00003.gguf"
+        build_gguf(decoy, {"general.architecture": (8, "llama")})
+        fp = inspect_model(primary)
+        assert fp.architecture == "llama"
+        assert len(fp.shards) == 3
+
+    def test_normal_shards_unchanged(self, tmp_path: Path) -> None:
+        primary = self._build_shards(tmp_path, "model", 3)
+        decoy = tmp_path / "myX-model-00001-of-00003.gguf"
+        build_gguf(decoy, {"general.architecture": (8, "llama")})
+        fp = inspect_model(primary)
+        assert fp.architecture == "llama"
+        assert len(fp.shards) == 3

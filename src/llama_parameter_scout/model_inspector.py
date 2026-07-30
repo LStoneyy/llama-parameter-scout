@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import glob
 import hashlib
 import os
 import re
@@ -28,8 +29,52 @@ GGUF_VALUE_TYPE_INT64 = 11
 GGUF_VALUE_TYPE_FLOAT64 = 12
 
 _MAX_STRING_LENGTH = 10 * 1024 * 1024
-_MAX_ARRAY_LENGTH = 10 * 1024 * 1024
+_MAX_ARRAY_LENGTH = 1_000_000
 _MAX_KV_COUNT = 10 * 1024
+
+
+class _GGUFReadBudget:
+    __slots__ = (
+        "_wire_bytes_remaining",
+        "_value_count_remaining",
+        "_max_array_nesting",
+        "_max_array_length",
+        "_array_depth",
+    )
+
+    def __init__(
+        self,
+        wire_bytes: int = 128 * 1024 * 1024,
+        max_values: int = 2_000_000,
+        max_array_nesting: int = 16,
+        max_array_length: int = _MAX_ARRAY_LENGTH,
+    ) -> None:
+        self._wire_bytes_remaining = wire_bytes
+        self._value_count_remaining = max_values
+        self._max_array_nesting = max_array_nesting
+        self._max_array_length = max_array_length
+        self._array_depth = 0
+
+    def reserve_bytes(self, n: int) -> None:
+        if self._wire_bytes_remaining < n:
+            raise ModelRejectedError("Metadata byte budget exceeded")
+        self._wire_bytes_remaining -= n
+
+    def count_value(self) -> None:
+        if self._value_count_remaining <= 0:
+            raise ModelRejectedError("Metadata element budget exceeded")
+        self._value_count_remaining -= 1
+
+    def enter_array(self, element_count: int) -> None:
+        if self._array_depth >= self._max_array_nesting:
+            raise ModelRejectedError("Array nesting depth exceeded")
+        if element_count >= self._value_count_remaining:
+            raise ModelRejectedError("Metadata element budget exceeded")
+        self._array_depth += 1
+
+    def leave_array(self) -> None:
+        self._array_depth -= 1
+
 
 _FILE_TYPE_NAMES: dict[int, str] = {
     0: "ALL_F32",
@@ -367,7 +412,7 @@ def _resolve_shards(primary: Path, diagnostics: list[str]) -> list[ShardFingerpr
                     f"does not match filename total={total}: {shard_path}",
                 )
 
-    glob_pattern = f"{prefix}-*-of-{total:0{total_width}d}.gguf"
+    glob_pattern = f"{glob.escape(prefix)}-*-of-{total:0{total_width}d}.gguf"
     for extra in directory.glob(glob_pattern):
         if extra not in seen_paths:
             raise ModelRejectedError(
@@ -405,32 +450,36 @@ def _sha256(path: Path) -> str:
 # ── GGUF metadata reader ─────────────────────────────────────────
 
 
-def _read_gguf_metadata(path: Path) -> dict[str, Any]:
+def _read_gguf_metadata(
+    path: Path,
+    _budget: _GGUFReadBudget | None = None,
+) -> dict[str, Any]:
     try:
         with open(path, "rb") as f:
-            return _parse_gguf(f, path)
+            budget = _GGUFReadBudget() if _budget is None else _budget
+            return _parse_gguf(f, path, budget)
     except (OSError, struct.error, UnicodeDecodeError, EOFError) as e:
         raise ModelRejectedError(
             f"Failed to read GGUF metadata from {path}: {e}",
         ) from e
 
 
-def _parse_gguf(f: BinaryIO, path: Path) -> dict[str, Any]:
-    magic = _read_exact(f, 4)
+def _parse_gguf(f: BinaryIO, path: Path, budget: _GGUFReadBudget) -> dict[str, Any]:
+    magic = _read_exact(f, 4, budget)
     if magic != GGUF_MAGIC:
         raise ModelRejectedError(
             f"Not a GGUF file (bad magic: {magic!r}): {path}",
         )
 
-    version = struct.unpack("<I", _read_exact(f, 4))[0]
+    version = struct.unpack("<I", _read_exact(f, 4, budget))[0]
     if version not in (2, 3):
         raise ModelRejectedError(
             f"Unsupported GGUF version {version}. "
             "Only versions 2 and 3 are supported.",
         )
 
-    _tensor_count = struct.unpack("<Q", _read_exact(f, 8))[0]
-    kv_count = struct.unpack("<Q", _read_exact(f, 8))[0]
+    _tensor_count = struct.unpack("<Q", _read_exact(f, 8, budget))[0]
+    kv_count = struct.unpack("<Q", _read_exact(f, 8, budget))[0]
 
     if kv_count > _MAX_KV_COUNT:
         raise ModelRejectedError(
@@ -439,15 +488,16 @@ def _parse_gguf(f: BinaryIO, path: Path) -> dict[str, Any]:
 
     metadata: dict[str, Any] = {}
     for _ in range(kv_count):
-        key = _read_gguf_string(f, path)
-        value_type = struct.unpack("<I", _read_exact(f, 4))[0]
-        value = _read_gguf_value(f, value_type, path)
+        key = _read_gguf_string(f, path, budget)
+        value_type = struct.unpack("<I", _read_exact(f, 4, budget))[0]
+        value = _read_gguf_value(f, value_type, path, budget)
         metadata[key] = value
 
     return metadata
 
 
-def _read_exact(f: BinaryIO, n: int) -> bytes:
+def _read_exact(f: BinaryIO, n: int, budget: _GGUFReadBudget) -> bytes:
+    budget.reserve_bytes(n)
     data = f.read(n)
     if len(data) < n:
         raise EOFError(
@@ -456,47 +506,72 @@ def _read_exact(f: BinaryIO, n: int) -> bytes:
     return data
 
 
-def _read_gguf_string(f: BinaryIO, path: Path) -> str:
-    length = struct.unpack("<Q", _read_exact(f, 8))[0]
+def _read_gguf_string(f: BinaryIO, path: Path, budget: _GGUFReadBudget) -> str:
+    length = struct.unpack("<Q", _read_exact(f, 8, budget))[0]
     if length > _MAX_STRING_LENGTH:
         raise ModelRejectedError(
             f"GGUF string length {length} exceeds maximum {_MAX_STRING_LENGTH}: {path}",
         )
-    raw = _read_exact(f, length)
+    raw = _read_exact(f, length, budget)
+    budget.count_value()
     return raw.decode("utf-8")
 
 
-def _read_gguf_value(f: BinaryIO, value_type: int, path: Path) -> Any:
+def _read_gguf_value(
+    f: BinaryIO,
+    value_type: int,
+    path: Path,
+    budget: _GGUFReadBudget,
+) -> Any:
     if value_type == GGUF_VALUE_TYPE_UINT8:
-        return struct.unpack("<B", _read_exact(f, 1))[0]
+        budget.count_value()
+        return struct.unpack("<B", _read_exact(f, 1, budget))[0]
     if value_type == GGUF_VALUE_TYPE_INT8:
-        return struct.unpack("<b", _read_exact(f, 1))[0]
+        budget.count_value()
+        return struct.unpack("<b", _read_exact(f, 1, budget))[0]
     if value_type == GGUF_VALUE_TYPE_UINT16:
-        return struct.unpack("<H", _read_exact(f, 2))[0]
+        budget.count_value()
+        return struct.unpack("<H", _read_exact(f, 2, budget))[0]
     if value_type == GGUF_VALUE_TYPE_INT16:
-        return struct.unpack("<h", _read_exact(f, 2))[0]
+        budget.count_value()
+        return struct.unpack("<h", _read_exact(f, 2, budget))[0]
     if value_type == GGUF_VALUE_TYPE_UINT32:
-        return struct.unpack("<I", _read_exact(f, 4))[0]
+        budget.count_value()
+        return struct.unpack("<I", _read_exact(f, 4, budget))[0]
     if value_type == GGUF_VALUE_TYPE_INT32:
-        return struct.unpack("<i", _read_exact(f, 4))[0]
+        budget.count_value()
+        return struct.unpack("<i", _read_exact(f, 4, budget))[0]
     if value_type == GGUF_VALUE_TYPE_FLOAT32:
-        return struct.unpack("<f", _read_exact(f, 4))[0]
+        budget.count_value()
+        return struct.unpack("<f", _read_exact(f, 4, budget))[0]
     if value_type == GGUF_VALUE_TYPE_BOOL:
-        return bool(struct.unpack("<B", _read_exact(f, 1))[0])
+        budget.count_value()
+        return bool(struct.unpack("<B", _read_exact(f, 1, budget))[0])
     if value_type == GGUF_VALUE_TYPE_STRING:
-        return _read_gguf_string(f, path)
+        return _read_gguf_string(f, path, budget)
     if value_type == GGUF_VALUE_TYPE_ARRAY:
-        elem_type = struct.unpack("<I", _read_exact(f, 4))[0]
-        length = struct.unpack("<Q", _read_exact(f, 8))[0]
-        if length > _MAX_ARRAY_LENGTH:
+        elem_type = struct.unpack("<I", _read_exact(f, 4, budget))[0]
+        length = struct.unpack("<Q", _read_exact(f, 8, budget))[0]
+        if length > budget._max_array_length:
             raise ModelRejectedError(
-                f"GGUF array length {length} exceeds maximum {_MAX_ARRAY_LENGTH}: {path}",
+                f"GGUF array length {length} exceeds maximum {budget._max_array_length}: {path}",
             )
-        return [_read_gguf_value(f, elem_type, path) for _ in range(length)]
+        budget.enter_array(length)
+        budget.count_value()
+        try:
+            result = [
+                _read_gguf_value(f, elem_type, path, budget) for _ in range(length)
+            ]
+        finally:
+            budget.leave_array()
+        return result
     if value_type == GGUF_VALUE_TYPE_UINT64:
-        return struct.unpack("<Q", _read_exact(f, 8))[0]
+        budget.count_value()
+        return struct.unpack("<Q", _read_exact(f, 8, budget))[0]
     if value_type == GGUF_VALUE_TYPE_INT64:
-        return struct.unpack("<q", _read_exact(f, 8))[0]
+        budget.count_value()
+        return struct.unpack("<q", _read_exact(f, 8, budget))[0]
     if value_type == GGUF_VALUE_TYPE_FLOAT64:
-        return struct.unpack("<d", _read_exact(f, 8))[0]
+        budget.count_value()
+        return struct.unpack("<d", _read_exact(f, 8, budget))[0]
     raise ModelRejectedError(f"Unknown GGUF metadata value type: {value_type}")
