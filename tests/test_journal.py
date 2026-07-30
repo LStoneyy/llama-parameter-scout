@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import builtins
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-from llama_parameter_scout.journal import read_journal_events, write_observation
+import pytest
+
+from llama_parameter_scout.journal import (
+    _read_journal,
+    read_journal_events,
+    write_observation,
+)
 from llama_parameter_scout.models import (
     BenchmarkObservation,
     CandidateConfig,
+    JournalError,
     ModelFingerprint,
     ShardFingerprint,
     ToolchainFingerprint,
@@ -189,3 +197,79 @@ class TestWriteObservation:
         write_observation(path, obs)
         temps = list(tmp_path.glob(".*.json.*.tmp"))
         assert len(temps) == 0
+
+
+class TestReadJournalSecurity:
+    def test_empty_file_raises_journal_error(self, tmp_path: Path) -> None:
+        path = tmp_path / "journal.json"
+        path.write_text("")
+        with pytest.raises(JournalError, match="empty"):
+            _read_journal(path)
+
+    def test_invalid_utf8_raises_journal_error(self, tmp_path: Path) -> None:
+        path = tmp_path / "journal.json"
+        path.write_bytes(b"\xff\xfe\x00\x01")
+        with pytest.raises(JournalError, match="UTF-8"):
+            _read_journal(path)
+
+    def test_journal_at_limit(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        small_limit = 64
+        monkeypatch.setattr("llama_parameter_scout.journal._MAX_JOURNAL_BYTES", small_limit)
+        path = tmp_path / "journal.json"
+        body = '{"schema_version": 5, "events": []}'
+        content = body + " " * (small_limit - len(body))
+        assert len(content) == small_limit
+        path.write_text(content)
+        result = _read_journal(path)
+        assert result is not None
+        assert result["schema_version"] == 5
+        assert result["events"] == []
+
+    def test_journal_exceeds_limit_by_one(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        small_limit = 64
+        monkeypatch.setattr("llama_parameter_scout.journal._MAX_JOURNAL_BYTES", small_limit)
+        path = tmp_path / "journal.json"
+        path.write_text("x" * (small_limit + 1))
+        with pytest.raises(JournalError, match="exceeds"):
+            _read_journal(path)
+
+    def test_sparse_file_bounded_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        small_limit = 64
+        monkeypatch.setattr("llama_parameter_scout.journal._MAX_JOURNAL_BYTES", small_limit)
+        path = tmp_path / "journal.json"
+        with open(path, "wb") as f:
+            f.write(b"{}")
+            f.seek(small_limit * 100)
+            f.write(b" ")
+
+        read_args: list[int] = []
+
+        def spy_read(orig_read: Any, n: int = -1) -> bytes:
+            read_args.append(n)
+            return cast(bytes, orig_read(n))
+
+        original_open = builtins.open
+
+        class _SpyFile:
+            def __init__(self, inner: Any) -> None:
+                self._inner = inner
+            def __enter__(self) -> _SpyFile:
+                return self
+            def __exit__(self, *args: object) -> None:
+                self._inner.close()
+            def read(self, n: int = -1) -> bytes:
+                return spy_read(self._inner.read, n)
+
+        def _spy_open(path: Any, mode: str = "rb") -> _SpyFile:
+            return _SpyFile(original_open(path, mode))
+
+        monkeypatch.setattr(builtins, "open", _spy_open)
+
+        with pytest.raises(JournalError):
+            _read_journal(path)
+
+        assert read_args == [small_limit + 1]

@@ -29,6 +29,7 @@ from .models import (
 )
 
 _SCHEMA_VERSION = 5
+_MAX_JOURNAL_BYTES = 128 * 1024 * 1024
 
 
 def _now() -> str:
@@ -58,9 +59,20 @@ def _read_journal(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
     try:
-        raw = path.read_text()
+        with open(path, "rb") as f:
+            raw_bytes = f.read(_MAX_JOURNAL_BYTES + 1)
     except OSError as e:
         raise JournalError(f"Cannot read journal at {path}: {e}") from e
+    if len(raw_bytes) > _MAX_JOURNAL_BYTES:
+        raise JournalError(
+            f"Journal at {path} exceeds {_MAX_JOURNAL_BYTES} bytes",
+        )
+    try:
+        raw = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise JournalError(
+            f"Journal at {path} is not valid UTF-8: {e}",
+        ) from e
     if not raw.strip():
         raise JournalError(f"Journal at {path} is empty")
     try:
