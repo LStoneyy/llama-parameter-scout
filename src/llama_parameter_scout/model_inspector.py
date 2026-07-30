@@ -557,8 +557,8 @@ def _read_gguf_value(
                 f"GGUF array length {length} exceeds maximum {budget._max_array_length}: {path}",
             )
         budget.enter_array(length)
-        budget.count_value()
         try:
+            budget.count_value()
             result = [
                 _read_gguf_value(f, elem_type, path, budget) for _ in range(length)
             ]

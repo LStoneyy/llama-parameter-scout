@@ -601,6 +601,24 @@ class TestGgufReadBudget:
             "an array element was read despite budget rejection"
         )
 
+    # -- depth restored after post-enter failure -----------------------
+
+    def test_array_depth_restored_after_element_read_failure(self, tmp_path: Path) -> None:
+        """Element read inside try block fails; finally must restore depth."""
+        p = tmp_path / "model.gguf"
+        build_gguf(p, {"arr": (9, (5, [10, 20, 30]))})
+        raw = p.read_bytes()
+
+        budget = _GGUFReadBudget(
+            wire_bytes=51, max_values=10, max_array_nesting=5,
+        )
+        stream = io.BytesIO(raw)
+        with pytest.raises(ModelRejectedError, match="Metadata byte budget exceeded"):
+            _parse_gguf(stream, p, budget)
+        assert budget._array_depth == 0, (
+            f"Array depth left at {budget._array_depth} after element read failure"
+        )
+
 
 class TestShardPrefix:
     """Verify glob.escape does not break special-char prefixes.
