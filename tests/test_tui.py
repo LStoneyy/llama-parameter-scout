@@ -1156,10 +1156,24 @@ async def test_progress_ctrlq_triggers_quit(monkeypatch: Any) -> None:
 # ── Progress screen (unit) ──────────────────────────────────────
 
 
+class _ManualProgressScreen(ProgressScreen):
+    """ProgressScreen whose on_mount does not start the benchmark worker.
+
+    The real screen starts ``run_benchmark`` from ``on_mount``; with
+    ``app.prepared`` left unset that worker posts a spurious ``RunError``.
+    Tests that drive ``RunComplete``/``RunError`` messages directly must
+    mount this stub so no background worker races the manually posted
+    message (which was the source of a Windows CI flake).
+    """
+
+    def on_mount(self) -> None:
+        pass
+
+
 async def test_progress_displays_events() -> None:
     app = ScoutTuiApp()
     async with app.run_test() as pilot:
-        ps = ProgressScreen()
+        ps = _ManualProgressScreen()
         app.push_screen(ps)
         await pilot.pause()
         ps.post_message(RunProgress(ProgressEvent(
@@ -1172,7 +1186,7 @@ async def test_progress_displays_events() -> None:
 async def test_progress_displays_error() -> None:
     app = ScoutTuiApp()
     async with app.run_test() as pilot:
-        ps = ProgressScreen()
+        ps = _ManualProgressScreen()
         app.push_screen(ps)
         await pilot.pause()
         ps.post_message(RunError("Something broke"))
@@ -1183,7 +1197,7 @@ async def test_progress_displays_error() -> None:
 async def test_progress_complete_goes_to_results() -> None:
     app = ScoutTuiApp()
     async with app.run_test() as pilot:
-        ps = ProgressScreen()
+        ps = _ManualProgressScreen()
         app.push_screen(ps)
         await pilot.pause()
         ps.post_message(RunComplete(
@@ -1193,12 +1207,16 @@ async def test_progress_complete_goes_to_results() -> None:
         ))
         await pilot.pause()
         assert isinstance(app.screen, ResultsScreen)
+        tabs = app.screen.query_one(TabbedContent)
+        assert tabs.active == "tab-markdown"
+        md_text = await _wait_for_richlog(pilot, app.screen, "#md-content", "# Results")
+        assert "encountered an error" in md_text
 
 
 async def test_progress_cancelled_shows_results() -> None:
     app = ScoutTuiApp()
     async with app.run_test() as pilot:
-        ps = ProgressScreen()
+        ps = _ManualProgressScreen()
         app.push_screen(ps)
         await pilot.pause()
         ps.post_message(RunComplete(
@@ -1209,6 +1227,12 @@ async def test_progress_cancelled_shows_results() -> None:
         ))
         await pilot.pause()
         assert isinstance(app.screen, ResultsScreen)
+        tabs = app.screen.query_one(TabbedContent)
+        assert tabs.active == "tab-markdown"
+        md_text = await _wait_for_richlog(
+            pilot, app.screen, "#md-content", "# Benchmark Cancelled"
+        )
+        assert "cancelled before completion" in md_text
 
 
 async def test_cancellation_sets_event() -> None:

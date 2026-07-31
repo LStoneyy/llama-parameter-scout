@@ -1385,7 +1385,7 @@ class ResultsScreen(Screen[ScoutTuiApp]):
     def compose(self) -> ComposeResult:
         with Vertical():
             yield Header()
-            with TabbedContent(initial="tab-markdown"):
+            with TabbedContent():
                 with TabPane("Markdown Report", id="tab-markdown"):
                     yield RichLog(id="md-content", highlight=True, markup=False)
                 with TabPane("Preset.ini", id="tab-preset"):

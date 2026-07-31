@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   quality:
-    name: "Quality (${{ matrix.os }})"
+    name: "Quality (${{ matrix.os }}, Python ${{ matrix.python-version }})"
     strategy:
       fail-fast: false
       matrix:
@@ -59,13 +59,17 @@ jobs:
   release-gate:
     name: Release Gate
     needs: [quality, smoke]
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
-        with:
-          python-version: "3.12"
-      - name: Check smoke passed
-        run: echo "All release gates passed — smoke tests and quality checks are green."
+      - name: Check quality and smoke results
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          SMOKE_RESULT: ${{ needs.smoke.result }}
+        run: |
+          if [[ "$QUALITY_RESULT" == "success" && "$SMOKE_RESULT" == "success" ]]; then
+            echo "All release gates passed — smoke tests and quality checks are green."
+          else
+            echo "::error::Release gate failed — quality=$QUALITY_RESULT, smoke=$SMOKE_RESULT"
+            exit 1
+          fi
