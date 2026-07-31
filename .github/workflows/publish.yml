@@ -15,6 +15,10 @@ jobs:
   pypi-publish:
     name: Upload to PyPI (trusted publishing)
     needs: [ci]
+    if: >-
+      github.event_name == 'release' ||
+      (github.event_name == 'workflow_dispatch' &&
+       github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -26,6 +30,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+          fetch-depth: 0
+      - name: Verify commit is reachable from main
+        run: |
+          git fetch origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "::error::Commit $GITHUB_SHA is not an ancestor of origin/main — publishing blocked"
+            exit 1
+          }
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           python-version: "3.12"
