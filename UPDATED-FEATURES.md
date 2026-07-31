@@ -1,22 +1,25 @@
 # UPDATED-FEATURES — Implementation Plan
 
-**Status:** Proposed — awaiting approval before implementation.
+**Status:** Finalized — approved for implementation.
 **Author:** planning pass (orchestrated).
 **Scope:** four phases. Each phase is independently reviewable, tested, and committed.
 
 This document is a *plan*, not a changelog. Nothing here is implemented yet. It
-exists so the maintainer can approve the direction and the concrete surface
-changes before any code is written.
+records the approved direction and the concrete surface changes that
+implementation will follow.
 
 ---
 
 ## Baseline assessment
 
+Baseline anchored to branch `plan/updated-features` at HEAD `f744244`
+(2026-07-31) before this plan was finalized.
+
 The codebase is in good health and this plan does **not** exist to fix breakage:
 
 - `ruff check src tests` — clean.
 - `mypy` (strict) — clean, 36 source files.
-- `pytest` (default markers) — **845 passed**, 7 deselected.
+- `pytest` (default markers) — **867 passed**, 7 deselected.
 - CI matrix — 3 OS × 3 Python versions, plus a CPU smoke job and a release gate.
 - `.gitignore` correctly excludes runtime artifacts (`journal.json`, `dist/`,
   models, reports, `preset.ini`, `scout-report.md`).
@@ -24,7 +27,7 @@ The codebase is in good health and this plan does **not** exist to fix breakage:
 The improvements below are therefore about **product completeness,
 architecture, CLI ergonomics, and documentation** — not defect repair.
 
-Source sizes at time of writing:
+Source sizes for selected major modules at time of writing:
 
 | File | LOC | Note |
 |------|-----|------|
@@ -34,7 +37,7 @@ Source sizes at time of writing:
 | `search.py` | 1169 | Staged search / screening |
 | `mtp.py` | 1059 | Multi-token-prediction comparison/profile |
 | `models.py` | 649 | Typed domain model |
-| `cli.py` | 587 | argparse front-end (`main()` is 194 lines) |
+| `cli.py` | 587 | argparse front-end (`main()` is 191 lines) |
 
 ---
 
@@ -73,7 +76,7 @@ the surface Phase 2 will restructure.
 ### Core interfaces to wire (already implemented, signatures confirmed)
 
 ```
-setup_session(model, n_ctx, candidate, cpu_only, device_ids, budget_overrides, acknowledged)
+setup_session(model, n_ctx, candidate, cpu_only, device_ids, budget_overrides, headroom_ratio, acknowledged)
 start_or_resume_session(journal_path, spec, model, candidate, profile, objective, toolchain)
 screen_candidates(request, profile, *, objective, session_spec, policy, ...) -> ScreeningReport
 validate_candidates(request, screening_report, *, budget, objective, session_spec, policy, ...)
@@ -100,7 +103,7 @@ validate_candidates → (optional collect_mtp_profile) → export_report_*`.
 - **JSON result to stdout:** `--json` prints a structured result object
   (recommendation + provenance + per-candidate summary) for CI consumption,
   suppressing human-formatted prose. Exit code reflects outcome
-  (winner = 0, no-winner = documented non-zero).
+  (winner = 0, no-winner = 2).
 - **Progress:** reuse the existing `ProgressCallback`/`on_progress` hooks to
   emit line-based progress to stderr; silence with `--quiet`.
 
@@ -110,10 +113,11 @@ validate_candidates → (optional collect_mtp_profile) → export_report_*`.
   additionally needs a `llama-server` path and a draft model, i.e. more new
   flags and a `ServerLifecycle`. Kept separate to keep Phase 1 tight.
 
-### Phase 1b (optional, same phase family) — MTP in the CLI
+### Phase 1b (optional, separately approved follow-up) — MTP in the CLI
 
 - `--draft-model PATH`, `--server-path PATH`, then wire `compare_mtp` and
-  `collect_mtp_profile`. Only pursued after Phase 1 lands and if desired.
+  `collect_mtp_profile`. Only pursued after Phase 1 lands, and only if
+  separately approved.
 
 ### Tests (Phase 1)
 
@@ -127,16 +131,17 @@ validate_candidates → (optional collect_mtp_profile) → export_report_*`.
 
 - `llama-parameter-scout` can run a full search and emit a recommendation +
   exported report from the shell, no TUI.
-- ruff + mypy clean; new tests green; existing 845 tests unaffected.
+- ruff + mypy clean; new tests green; existing 867 tests unaffected.
 
 ---
 
 ## Phase 2 — CLI subcommands + slimmed `main()`
 
-**Decision (approved):** move to real **subcommands**. The tool is not yet on
+**Decision (approved, locked):** move to real **subcommands**. The command
+names in the displayed surface below are locked. The tool is not yet on
 PyPI, so there are no released users to break — this is the correct moment.
 
-**Goal:** replace the single flat `argparse` namespace and the 194-line
+**Goal:** replace the single flat `argparse` namespace and the 191-line
 `main()` with a subcommand dispatcher and one thin handler per command.
 
 ### Proposed command surface
@@ -188,7 +193,7 @@ llama-parameter-scout mtp       # MTP compare/profile (only if Phase 1b is done)
 
 **Goal:** split the 2791-line module into cohesive units with the
 `Application` class staying as a thin orchestrator. **Behavior is unchanged** —
-this is a pure structural refactor, guarded by the 845-test suite.
+this is a pure structural refactor, guarded by the 867-test suite.
 
 ### Constraint: preserve import paths
 
@@ -213,11 +218,12 @@ a compatibility layer, then remove.
 | `fingerprint.py` | `_canonical_json`, `_compute_session_fingerprint`, `_compute_full_fingerprint_components`, `_compare_fingerprint_components`, `_capture_environment` |
 | `estimation.py` | `_cache_element_size`, `_is_quantized_cache`, `_compute_model_weight_bytes`, `_estimate_advisory`, `_detect_available_memory_bytes`, `make_memory_pressure_fn`, `_check_resource_budget`, `_validate_budget`, `pre_execution_disposition` |
 | `serialization.py` | `_dict_to_observation`, `_dict_to_screening_result` |
-| `application.py` (kept) | `Application` class, `setup_session`/`start_or_resume_session`/`evaluate_candidate`/`screen_candidates`/`validate_candidates`/`run`/`compare_mtp`/`collect_mtp_profile`/`export_report_*`, `_validate_request`, `_screening_preflight`, `_run_screening_workload`, `_build_workload_session_spec`, `_journal_*`, `list_session_summaries` |
+| `application.py` (kept) | `Application` class, `setup_session`/`start_or_resume_session`/`evaluate_candidate`/`screen_candidates`/`validate_candidates`/`run`/`compare_mtp`/`collect_mtp_profile`/`export_report_*`, `_validate_request`, `_validate_device_selection`, `_validate_ngl_consistency`, `_check_context_acknowledgement`, `_validate_nctx_at_setup`, `_screening_preflight`, `_run_screening_workload`, `_build_workload_session_spec`, `_journal_*`, `list_session_summaries` |
 
 Exact assignment refined during implementation to respect call graphs (some
 helpers may sit with their sole caller). Target: `application.py` under ~1200
-lines, no module over ~600.
+lines, no module over ~600. These LOC values are directional targets, not hard
+acceptance requirements.
 
 ### Tests (Phase 3)
 
@@ -230,7 +236,7 @@ lines, no module over ~600.
 ### Deliverable / acceptance
 
 - Same behavior, smaller modules, no import breakage, ruff + mypy clean,
-  845 tests still green.
+  867 tests still green.
 
 ---
 
@@ -252,15 +258,17 @@ subcommand CLI.
   - `docs/journal.md` — journal schema (v5), resume/derive semantics.
   - `docs/troubleshooting.md` — GPU/backend matrix, network safety, errors.
 - Cross-link from the README table of contents.
-- Resolve the PyPI **TODO**: either document the real `pipx`/`uv tool` install
-  once published, or clearly mark it "from source only until v0.1 is on PyPI".
+- Resolve the PyPI **TODO**: **decided** — document installation as
+  **source-only until the package is published to PyPI**. The `pipx`/`uv tool`
+  install instructions are only added once published (v0.1 or later).
 
 ### PyPI note (maintainer action, not code)
 
-- `publish.yml` already exists. Actually publishing needs the maintainer's PyPI
-  project + Trusted Publishing (OIDC) config. This plan documents the readiness
-  and updates install docs; the publish action itself is a maintainer decision
-  and is **not** performed as part of these phases.
+- **Decision:** installation remains explicitly source-only until PyPI
+  publication. `publish.yml` already exists. Actually publishing needs the
+  maintainer's PyPI project + Trusted Publishing (OIDC) config. This plan
+  documents the readiness and updates install docs; the publish action itself is
+  a maintainer decision and is **not** performed as part of these phases.
 
 ### Tests (Phase 4)
 
