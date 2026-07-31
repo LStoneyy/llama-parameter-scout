@@ -34,7 +34,10 @@ Benchmark llama.cpp models across candidate configurations by driving `llama-ben
 ### from source (development)
 
 ```bash
-git clone <repo>
+# Install uv if needed
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+git clone https://github.com/LStoneyy/llama-parameter-scout.git
 cd llama-parameter-scout
 uv sync --all-extras
 ```
@@ -43,7 +46,7 @@ uv sync --all-extras
 
 ```bash
 # Single-run benchmark via CLI
-llama-parameter-scout \
+uv run llama-parameter-scout \
   --llama-bench /path/to/llama-bench \
   --model-path /path/to/model.gguf \
   --journal-path ./journal.json \
@@ -52,7 +55,7 @@ llama-parameter-scout \
   --cpu-only --yes
 
 # Launch the Textual TUI wizard
-llama-parameter-scout --tui
+uv run llama-parameter-scout --tui
 ```
 
 ## TUI (Textual User Interface)
