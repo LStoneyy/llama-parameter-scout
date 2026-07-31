@@ -88,6 +88,28 @@ async def _wait_for_richlog(
     )
 
 
+async def _wait_for_active_tab(
+    pilot: Any, tabs: Any, tab_id: str, *, attempts: int = 100,
+) -> None:
+    """Poll ``tabs.active`` until it equals ``tab_id``.
+
+    ``TabbedContent`` activates its first pane via an asynchronous
+    child-to-parent Textual message, so immediately after a screen push
+    the ``active`` attribute may still be empty even after one
+    ``await pilot.pause()``. Poll for a bounded number of iterations
+    instead of asserting after one pause, so the test stays robust
+    without relying on unconditional sleeps.
+    """
+    for _ in range(attempts):
+        if tabs.active == tab_id:
+            return
+        await pilot.pause()
+    raise AssertionError(
+        f"Expected TabbedContent.active to be {tab_id!r} after {attempts} "
+        f"pilot.pause() iterations; active is {tabs.active!r}"
+    )
+
+
 _SAMPLE_TOPO = SystemTopology(
     cpu_count=8, system_memory_bytes=17179869184,
     accelerators=(Accelerator(kind="gpu", backend="metal", device_id=0,
@@ -1207,9 +1229,9 @@ async def test_progress_complete_goes_to_results() -> None:
         ))
         await pilot.pause()
         assert isinstance(app.screen, ResultsScreen)
-        tabs = app.screen.query_one(TabbedContent)
-        assert tabs.active == "tab-markdown"
         md_text = await _wait_for_richlog(pilot, app.screen, "#md-content", "# Results")
+        tabs = app.screen.query_one(TabbedContent)
+        await _wait_for_active_tab(pilot, tabs, "tab-markdown")
         assert "encountered an error" in md_text
 
 
@@ -1227,11 +1249,11 @@ async def test_progress_cancelled_shows_results() -> None:
         ))
         await pilot.pause()
         assert isinstance(app.screen, ResultsScreen)
-        tabs = app.screen.query_one(TabbedContent)
-        assert tabs.active == "tab-markdown"
         md_text = await _wait_for_richlog(
             pilot, app.screen, "#md-content", "# Benchmark Cancelled"
         )
+        tabs = app.screen.query_one(TabbedContent)
+        await _wait_for_active_tab(pilot, tabs, "tab-markdown")
         assert "cancelled before completion" in md_text
 
 
