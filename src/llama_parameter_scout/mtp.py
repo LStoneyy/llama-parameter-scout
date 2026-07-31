@@ -7,6 +7,7 @@ import re
 import signal
 import socket
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -85,7 +86,7 @@ class ProductionServerLifecycle:
         start_new_session = os.name != "nt"
         creationflags = 0
         if os.name == "nt":
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined, unused-ignore]
         try:
             self._process = subprocess.Popen(
                 [str(a) for a in argv],
@@ -197,7 +198,7 @@ class FakeServerLifecycle:
 def _terminate_process_tree(proc: subprocess.Popen[Any]) -> None:
     if proc.returncode is not None:
         return
-    if os.name == "nt":
+    if sys.platform == "win32":
         try:
             subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],

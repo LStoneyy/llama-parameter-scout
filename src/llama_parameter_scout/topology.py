@@ -35,7 +35,7 @@ def detect_system_memory() -> int:
             if result.returncode == 0:
                 return int(result.stdout.strip())
         elif system == "Windows":
-            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined, unused-ignore]
             class MEMORYSTATUSEX(ctypes.Structure):
                 _fields_ = [
                     ("dwLength", ctypes.c_ulong),

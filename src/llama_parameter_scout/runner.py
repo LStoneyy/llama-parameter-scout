@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -93,7 +94,7 @@ class ProcessAdapter(Protocol):
 def _terminate_process_tree(proc: subprocess.Popen[Any]) -> None:
     if proc.returncode is not None:
         return
-    if os.name == "nt":
+    if sys.platform == "win32":
         try:
             subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
@@ -137,7 +138,7 @@ class ProductionProcessAdapter:
         start_new_session = False
         creationflags = 0
         if os.name == "nt":
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined, unused-ignore]
         else:
             start_new_session = True
 

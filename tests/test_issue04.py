@@ -1346,7 +1346,7 @@ class TestWindowsTermination:
             taskkill_called.append(cmd)
             return subprocess.CompletedProcess(cmd, 0)
 
-        monkeypatch.setattr("os.name", "nt")
+        monkeypatch.setattr("sys.platform", "win32")
         monkeypatch.setattr("subprocess.run", fake_run)
 
         proc = subprocess.Popen(["sleep", "60"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)

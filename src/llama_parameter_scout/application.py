@@ -2466,7 +2466,7 @@ def _detect_available_memory_bytes() -> int | None:
     elif sys.platform == "win32":
         try:
             import ctypes
-            from ctypes import wintypes  # type: ignore[attr-defined]
+            from ctypes import wintypes  # type: ignore[attr-defined, unused-ignore]
 
             class _MEMORYSTATUSEX(ctypes.Structure):
                 _fields_ = [
@@ -2483,8 +2483,10 @@ def _detect_available_memory_bytes() -> int | None:
 
             memory_status = _MEMORYSTATUSEX()
             memory_status.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(memory_status)):  # type: ignore[attr-defined]
-                return memory_status.ullAvailPhys
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(  # type: ignore[attr-defined, unused-ignore]
+                ctypes.byref(memory_status)
+            ):
+                return int(memory_status.ullAvailPhys)
         except (OSError, AttributeError, ImportError):
             pass
     return None
