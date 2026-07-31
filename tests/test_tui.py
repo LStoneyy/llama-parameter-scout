@@ -1472,7 +1472,12 @@ async def test_error_screen_back_button() -> None:
 
 
 async def test_keyboard_f10_advances(tmp_path: Path) -> None:
-    app = ScoutTuiApp(detect_topology_fn=_fake_detect_no_devices)
+    fa = FakeApp()
+    app = ScoutTuiApp(
+        app_factory=lambda r: fa,
+        detect_topology_fn=_fake_detect_no_devices,
+        **_tui_kw(),
+    )
     async with app.run_test() as pilot:
         await pilot.pause()
         ws = app.screen
