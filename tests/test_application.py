@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -148,6 +149,14 @@ class TestValidateRequest:
         with pytest.raises(BinaryNotFoundError, match="not a file"):
             _validate_request(req)
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason=(
+            "os.access(path, os.X_OK) on Windows never tests the executable bit; "
+            "it only checks existence/readability, so chmod cannot simulate a "
+            "non-executable file there."
+        ),
+    )
     def test_binary_not_executable(self, tmp_path: Path, valid_request: SingleRunRequest) -> None:
         p = tmp_path / "llama-bench"
         p.write_text("data")
@@ -543,6 +552,7 @@ class TestApplication:
         valid_request: SingleRunRequest,
         fake_runner: FakeRunner,
         valid_json_output: str,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         _enqueue_toolchain(fake_runner, valid_request.binary_path)
         warmup_argv = _build_argv(valid_request, repetitions=1)
@@ -555,18 +565,22 @@ class TestApplication:
             measure_argv,
             ProcessResult(returncode=0, stdout=valid_json_output, stderr=""),
         )
-        read_only = valid_request.journal_path.parent / "readonly"
-        read_only.mkdir(mode=0o444)
-        req = SingleRunRequest(
-            binary_path=valid_request.binary_path,
-            model_path=valid_request.model_path,
-            journal_path=read_only / "journal.json",
-            n_ctx=valid_request.n_ctx,
-            candidate=valid_request.candidate,
+
+        def _raise_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+            raise OSError("simulated disk failure")
+
+        # Deterministic, cross-platform fault injection: raise from the actual
+        # I/O call (tempfile.mkstemp, as used by journal._atomic_write) rather
+        # than relying on POSIX-only directory permission semantics (mkdir with
+        # a read-only mode is a no-op for directories on Windows). Patching at
+        # this level -- rather than patching _atomic_write itself -- still
+        # exercises the real `except OSError` wrapper in application.py.
+        monkeypatch.setattr(
+            "llama_parameter_scout.journal.tempfile.mkstemp", _raise_mkstemp,
         )
         app = Application(fake_runner)
         with pytest.raises(JournalError):
-            app.run(req)
+            app.run(valid_request)
 
     def test_preflight_no_process_launch(
         self,

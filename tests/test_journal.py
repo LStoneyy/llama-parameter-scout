@@ -101,9 +101,9 @@ class TestWriteObservation:
         assert o["median_tps"] == 45.3
         assert isinstance(o["dispersion_tps"], float)
         assert o["n_measurements"] == 3
-        assert o["binary_path"] == "/usr/local/bin/llama-bench"
+        assert o["binary_path"] == str(Path("/usr/local/bin/llama-bench"))
         assert o["binary_source"] == "explicit"
-        assert o["model_path"] == "/tmp/model.gguf"
+        assert o["model_path"] == str(Path("/tmp/model.gguf"))
 
     def test_toolchain_in_journal(self, tmp_path: Path) -> None:
         path = tmp_path / "journal.json"
@@ -111,7 +111,7 @@ class TestWriteObservation:
         write_observation(path, obs)
         o = _obs_data(path)
         tc = o["toolchain"]
-        assert tc["binary_path"] == "/usr/local/bin/llama-bench"
+        assert tc["binary_path"] == str(Path("/usr/local/bin/llama-bench"))
         assert tc["version"] == "1234"
         assert tc["supported_flags"] == [
             "-m", "-p", "-n", "-d", "-t", "-b", "-ub",
@@ -180,7 +180,7 @@ class TestWriteObservation:
         o = _obs_data(path)
         shards = o["model"]["shards"]
         assert len(shards) == 2
-        assert shards[0]["path"] == "/tmp/model-00001-of-00002.gguf"
+        assert shards[0]["path"] == str(Path("/tmp/model-00001-of-00002.gguf"))
         assert shards[0]["size_bytes"] == 12345
         assert shards[0]["modified_time"] == 1000000.0
         assert shards[0]["digest_sha256"] == "a" * 64

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -61,6 +62,14 @@ class TestResolveBinary:
         assert result.binary_path == bp
         assert result.source == "install_dir"
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason=(
+            "os.access(path, os.X_OK) on Windows never tests the executable bit; "
+            "it only checks existence/readability, so chmod cannot simulate a "
+            "non-executable file there."
+        ),
+    )
     def test_install_dir_non_executable_falls_to_path(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -111,6 +120,14 @@ class TestResolveBinary:
         assert result.binary_path == bp
         assert result.source == "path"
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason=(
+            "os.access(path, os.X_OK) on Windows never tests the executable bit; "
+            "it only checks existence/readability, so chmod cannot simulate a "
+            "non-executable file there."
+        ),
+    )
     def test_path_non_executable_skipped(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:

@@ -41,6 +41,7 @@ from llama_parameter_scout.runner import (
     ProcessResult,
     ProcessStartError,
 )
+from tests.conftest import write_fake_executable
 
 
 def _read_journal_first_payload(path: Path) -> dict[str, Any]:
@@ -916,9 +917,7 @@ class TestStopTracker:
 class TestProductionProcessAdapter:
     def test_runs_and_collects_output(self, tmp_path: Path) -> None:
         from llama_parameter_scout.runner import ProductionProcessAdapter
-        script = tmp_path / "echo.sh"
-        script.write_text("#!/bin/sh\necho hello")
-        script.chmod(0o755)
+        script = write_fake_executable(tmp_path, "echo_bin", "print('hello')\n")
         adapter = ProductionProcessAdapter()
         result = adapter.launch([str(script)])
         assert result.returncode == 0
@@ -926,28 +925,38 @@ class TestProductionProcessAdapter:
 
     def test_timeout_terminates(self, tmp_path: Path) -> None:
         from llama_parameter_scout.runner import ProductionProcessAdapter
-        script = tmp_path / "sleep.sh"
-        script.write_text("#!/bin/sh\nsleep 60\necho done")
-        script.chmod(0o755)
+        script = write_fake_executable(
+            tmp_path, "sleep_bin", "import time\ntime.sleep(60)\nprint('done')\n",
+        )
         adapter = ProductionProcessAdapter()
         result = adapter.launch(
             [str(script)],
-            timeout_seconds=0.1,
+            # Bumped from 0.1s: on Windows the "binary" is a .bat trampoline
+            # that spawns cmd.exe + a fresh Python interpreter, which is
+            # slower to start than a native /bin/sh script. The child sleeps
+            # for 60s regardless, so this still exercises timeout-triggered
+            # termination of a live process rather than a normal exit; it
+            # just adds margin against slow interpreter/shell startup.
+            timeout_seconds=0.3,
         )
         assert result.termination == "timeout"
         assert result.returncode != 0 or True
 
     def test_cancellation_terminates(self, tmp_path: Path) -> None:
         from llama_parameter_scout.runner import ProductionProcessAdapter
-        script = tmp_path / "sleep.sh"
-        script.write_text("#!/bin/sh\nsleep 60\necho done")
-        script.chmod(0o755)
+        script = write_fake_executable(
+            tmp_path, "sleep_bin", "import time\ntime.sleep(60)\nprint('done')\n",
+        )
         cancel = Event()
         adapter = ProductionProcessAdapter()
 
         def _set_cancel() -> None:
             import time
-            time.sleep(0.05)
+            # Bumped from 0.05s for the same reason as test_timeout_terminates:
+            # margin against slow cmd.exe + interpreter startup on Windows.
+            # The child still sleeps for 60s, so cancellation always fires
+            # against a genuinely live process either way.
+            time.sleep(0.3)
             cancel.set()
 
         import threading
@@ -961,9 +970,9 @@ class TestProductionProcessAdapter:
 
     def test_memory_pressure_triggers_oom(self, tmp_path: Path) -> None:
         from llama_parameter_scout.runner import ProductionProcessAdapter
-        script = tmp_path / "sleep.sh"
-        script.write_text("#!/bin/sh\nsleep 60\necho done")
-        script.chmod(0o755)
+        script = write_fake_executable(
+            tmp_path, "sleep_bin", "import time\ntime.sleep(60)\nprint('done')\n",
+        )
         pressure_count: list[int] = [0]
 
         def pressure_fn() -> bool:
@@ -982,9 +991,7 @@ class TestProductionProcessAdapter:
 
     def test_normal_exit_no_termination(self, tmp_path: Path) -> None:
         from llama_parameter_scout.runner import ProductionProcessAdapter
-        script = tmp_path / "ok.sh"
-        script.write_text("#!/bin/sh\necho ok")
-        script.chmod(0o755)
+        script = write_fake_executable(tmp_path, "ok_bin", "print('ok')\n")
         adapter = ProductionProcessAdapter()
         result = adapter.launch([str(script)])
         assert result.termination is None
@@ -1000,9 +1007,7 @@ class TestProductionProcessAdapter:
 
         from llama_parameter_scout.runner import ProductionProcessAdapter
 
-        script = tmp_path / "sleeper.sh"
-        script.write_text("#!/bin/sh\nsleep 60")
-        script.chmod(0o755)
+        script = write_fake_executable(tmp_path, "sleeper_bin", "import time\ntime.sleep(60)\n")
 
         original_wait = subprocess.Popen.wait
 
@@ -1016,7 +1021,12 @@ class TestProductionProcessAdapter:
         adapter = ProductionProcessAdapter()
         result = adapter.launch(
             [str(script)],
-            timeout_seconds=0.05,
+            # Bumped from 0.05s: see test_timeout_terminates. This test's
+            # actual assertion (returncode falls back to -1 because `wait`
+            # always raises TimeoutExpired) doesn't depend on precise timing,
+            # but a very short deadline unnecessarily races interpreter/shell
+            # startup on Windows.
+            timeout_seconds=0.3,
         )
         assert result.termination == "timeout"
         assert result.returncode != 0
@@ -1440,7 +1450,29 @@ class TestMemoryPressureDetection:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        # Force the win32 code path regardless of the host platform, and
+        # make `GlobalMemoryStatusEx` itself report failure (returns 0 per
+        # the WinAPI convention), rather than relying on `ctypes.windll` not
+        # existing at all. Monkeypatching only `sys.platform` (without this)
+        # passes trivially on macOS/Linux because `ctypes.windll` doesn't
+        # exist there and the resulting AttributeError is swallowed by the
+        # `except` -- but on real Windows the API succeeds and returns a
+        # real byte count, so that version never exercises the intended
+        # "API unavailable -> fall through to None" branch. `raising=False`
+        # lets this attribute be set on platforms where `ctypes.windll`
+        # doesn't normally exist.
         monkeypatch.setattr("sys.platform", "win32")
+
+        class _FakeKernel32:
+            @staticmethod
+            def GlobalMemoryStatusEx(_buffer: object) -> int:
+                return 0  # 0 == failure, per GlobalMemoryStatusEx's contract
+
+        class _FakeWindll:
+            kernel32 = _FakeKernel32()
+
+        monkeypatch.setattr("ctypes.windll", _FakeWindll(), raising=False)
+
         result = _detect_available_memory_bytes()
         assert result is None
 
@@ -1543,11 +1575,10 @@ class TestReturncodeHandling:
         tmp_path: Path,
     ) -> None:
         from llama_parameter_scout.runner import ProductionProcessAdapter
-        script = tmp_path / "sleeper.sh"
-        script.write_text("#!/bin/sh\nsleep 60")
-        script.chmod(0o755)
+        script = write_fake_executable(tmp_path, "sleeper_bin", "import time\ntime.sleep(60)\n")
         adapter = ProductionProcessAdapter()
-        result = adapter.launch([str(script)], timeout_seconds=0.05)
+        # Bumped from 0.05s: see test_timeout_terminates for rationale.
+        result = adapter.launch([str(script)], timeout_seconds=0.3)
         assert result.termination == "timeout"
         assert result.returncode != 0
 
@@ -1556,9 +1587,7 @@ class TestReturncodeHandling:
         tmp_path: Path,
     ) -> None:
         from llama_parameter_scout.runner import ProductionProcessAdapter
-        script = tmp_path / "ok.sh"
-        script.write_text("#!/bin/sh\necho ok")
-        script.chmod(0o755)
+        script = write_fake_executable(tmp_path, "ok_bin", "print('ok')\n")
         adapter = ProductionProcessAdapter()
         result = adapter.launch([str(script)])
         assert result.returncode == 0

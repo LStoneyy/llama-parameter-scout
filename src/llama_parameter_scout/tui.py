@@ -1591,9 +1591,9 @@ class ResultsScreen(Screen[ScoutTuiApp]):
             shell_text = "\n".join(
                 str(line.text) for line in self.query_one("#shell-content", RichLog).lines
             )
-            (base_dir / "scout-report.md").write_text(md_text)
-            (base_dir / "preset.ini").write_text(preset_text)
-            (base_dir / "shell-commands.txt").write_text(shell_text)
+            (base_dir / "scout-report.md").write_text(md_text, encoding="utf-8")
+            (base_dir / "preset.ini").write_text(preset_text, encoding="utf-8")
+            (base_dir / "shell-commands.txt").write_text(shell_text, encoding="utf-8")
             self._show_save_msg(f"[green]Saved files in {base_dir}[/]")
         except OSError as e:
             self._show_save_msg(f"[red]Save failed: {e}[/]")

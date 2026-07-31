@@ -346,6 +346,10 @@ def _has_symlink_ancestor(path: Path) -> bool:
 # ── Shard resolution ─────────────────────────────────────────────
 
 
+def _extra_shard_glob(prefix: str, total: int, total_width: int) -> str:
+    return f"{glob.escape(prefix)}-*-of-{total:0{total_width}d}.gguf"
+
+
 def _resolve_shards(primary: Path, diagnostics: list[str]) -> list[ShardFingerprint]:
     shard_match = _SHARD_PATTERN.match(primary.name)
     if not shard_match:
@@ -412,7 +416,7 @@ def _resolve_shards(primary: Path, diagnostics: list[str]) -> list[ShardFingerpr
                     f"does not match filename total={total}: {shard_path}",
                 )
 
-    glob_pattern = f"{glob.escape(prefix)}-*-of-{total:0{total_width}d}.gguf"
+    glob_pattern = _extra_shard_glob(prefix, total, total_width)
     for extra in directory.glob(glob_pattern):
         if extra not in seen_paths:
             raise ModelRejectedError(

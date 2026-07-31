@@ -7,6 +7,39 @@ from pathlib import Path
 import pytest
 
 from llama_parameter_scout.cli import _parse_args, main
+from tests.conftest import write_fake_executable
+
+_LLAMA_BENCH_TEMPLATE = '''\
+import sys
+
+args = sys.argv[1:]
+if args and args[0] == "--version":
+    print("version: {version}")
+    print("backends: {backends}")
+    print("supported_flags: -m,-p,-n,-d,-t,-b,-ub,-ngl,-fa,-ctk,-ctv,-o,-r")
+    print("supported_output_formats: {output_formats}")
+elif args and args[0] == "--help":
+    print("usage: llama-bench")
+else:
+    print('[{{"samples_ts":[10.0,11.0,12.0]}}]')
+'''
+
+
+def _llama_bench_script(
+    version: str = "test123",
+    backends: str = "cpu,metal",
+    output_formats: str = "json,jsonl",
+) -> str:
+    """Python source for a fake llama-bench emitting the given fingerprint.
+
+    Mirrors the behavior of the equivalent ``#!/bin/sh`` fixture this
+    replaces: ``--version`` prints the fingerprint block, ``--help`` prints a
+    usage line, and any other invocation (a benchmark run) prints a single
+    JSON record.
+    """
+    return _LLAMA_BENCH_TEMPLATE.format(
+        version=version, backends=backends, output_formats=output_formats,
+    )
 
 
 def _make_gguf(path: Path) -> None:
@@ -285,21 +318,7 @@ class TestMain:
         capsys: pytest.CaptureFixture[str],
         tmp_path: Path,
     ) -> None:
-        bp = tmp_path / "llama-bench"
-        bp.write_text(
-            "#!/bin/sh\n"
-            'if [ "$1" = "--version" ]; then\n'
-            '  echo "version: test123"\n'
-            '  echo "backends: cpu,metal"\n'
-            '  echo "supported_flags: -m,-p,-n,-d,-t,-b,-ub,-ngl,-fa,-ctk,-ctv,-o,-r"\n'
-            '  echo "supported_output_formats: json,jsonl"\n'
-            "elif [ \"$1\" = \"--help\" ]; then\n"
-            '  echo "usage: llama-bench"\n'
-            "else\n"
-            '  echo \'[{"samples_ts":[10.0,11.0,12.0]}]\'\n'
-            "fi\n",
-        )
-        bp.chmod(0o755)
+        bp = write_fake_executable(tmp_path, "llama-bench", _llama_bench_script())
         mp = tmp_path / "model.gguf"
         _make_gguf(mp)
         jp = tmp_path / "journal.json"
@@ -349,24 +368,27 @@ class TestMain:
         self,
         capsys: pytest.CaptureFixture[str],
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         install = tmp_path / "install"
         install.mkdir()
-        bp = install / "llama-bench"
-        bp.write_text(
-            "#!/bin/sh\n"
-            'if [ "$1" = "--version" ]; then\n'
-            '  echo "version: test456"\n'
-            '  echo "backends: cpu"\n'
-            '  echo "supported_flags: -m,-p,-n,-d,-t,-b,-ub,-ngl,-fa,-ctk,-ctv,-o,-r"\n'
-            '  echo "supported_output_formats: json"\n'
-            "elif [ \"$1\" = \"--help\" ]; then\n"
-            '  echo "usage: llama-bench"\n'
-            "else\n"
-            '  echo \'[{"samples_ts":[10.0,11.0,12.0]}]\'\n'
-            "fi\n",
+        bp = write_fake_executable(
+            install,
+            "llama-bench",
+            _llama_bench_script(version="test456", backends="cpu", output_formats="json"),
         )
-        bp.chmod(0o755)
+        # `resolve_binary` discovers the toolchain in `install_dir` by exact
+        # filename (see `_platform_binary_names`). On Windows our fake
+        # "binary" is a `.bat` trampoline (a real executable would be a
+        # `.exe`), which isn't one of the names it searches for. Patch the
+        # expected name list to match what `write_fake_executable` actually
+        # produced, so this test still exercises install-dir discovery +
+        # end-to-end CLI wiring rather than the unrelated (and separately
+        # unit-tested in test_toolchain.py) exact-name-matching logic.
+        monkeypatch.setattr(
+            "llama_parameter_scout.toolchain._platform_binary_names",
+            lambda: [bp.name],
+        )
         mp = tmp_path / "model.gguf"
         _make_gguf(mp)
         jp = tmp_path / "journal.json"
@@ -396,21 +418,11 @@ class TestMain:
         capsys: pytest.CaptureFixture[str],
         tmp_path: Path,
     ) -> None:
-        bp = tmp_path / "llama-bench"
-        bp.write_text(
-            "#!/bin/sh\n"
-            'if [ "$1" = "--version" ]; then\n'
-            '  echo "version: test123"\n'
-            '  echo "backends: cpu"\n'
-            '  echo "supported_flags: -m,-p,-n,-d,-t,-b,-ub,-ngl,-fa,-ctk,-ctv,-o,-r"\n'
-            '  echo "supported_output_formats: json"\n'
-            "elif [ \"$1\" = \"--help\" ]; then\n"
-            '  echo "usage: llama-bench"\n'
-            "else\n"
-            '  echo \'[{"samples_ts":[10.0,11.0,12.0]}]\'\n'
-            "fi\n",
+        bp = write_fake_executable(
+            tmp_path,
+            "llama-bench",
+            _llama_bench_script(backends="cpu", output_formats="json"),
         )
-        bp.chmod(0o755)
         mp = tmp_path / "model.gguf"
         _make_gguf(mp)
         jp = tmp_path / "journal.json"
@@ -438,21 +450,16 @@ class TestMain:
     ) -> None:
         bindir = tmp_path / "bindir"
         bindir.mkdir()
-        bp = bindir / "llama-bench"
-        bp.write_text(
-            "#!/bin/sh\n"
-            'if [ "$1" = "--version" ]; then\n'
-            '  echo "version: path_test"\n'
-            '  echo "backends: cpu"\n'
-            '  echo "supported_flags: -m,-p,-n,-d,-t,-b,-ub,-ngl,-fa,-ctk,-ctv,-o,-r"\n'
-            '  echo "supported_output_formats: json"\n'
-            "elif [ \"$1\" = \"--help\" ]; then\n"
-            '  echo "usage: llama-bench"\n'
-            "else\n"
-            '  echo \'[{"samples_ts":[10.0,11.0,12.0]}]\'\n'
-            "fi\n",
+        bp = write_fake_executable(
+            bindir,
+            "llama-bench",
+            _llama_bench_script(version="path_test", backends="cpu", output_formats="json"),
         )
-        bp.chmod(0o755)
+        # See test_success_with_install_dir for why this is needed on Windows.
+        monkeypatch.setattr(
+            "llama_parameter_scout.toolchain._platform_binary_names",
+            lambda: [bp.name],
+        )
         monkeypatch.setenv("PATH", str(bindir))
         mp = tmp_path / "model.gguf"
         _make_gguf(mp)
@@ -488,21 +495,11 @@ class TestMain:
         capsys: pytest.CaptureFixture[str],
         tmp_path: Path,
     ) -> None:
-        bp = tmp_path / "llama-bench"
-        bp.write_text(
-            "#!/bin/sh\n"
-            'if [ "$1" = "--version" ]; then\n'
-            '  echo "version: test123"\n'
-            '  echo "backends: cpu"\n'
-            '  echo "supported_flags: -m,-p,-n,-d,-t,-b,-ub,-ngl,-fa,-ctk,-ctv,-o,-r"\n'
-            '  echo "supported_output_formats: json"\n'
-            "elif [ \"$1\" = \"--help\" ]; then\n"
-            '  echo "usage: llama-bench"\n'
-            "else\n"
-            '  echo \'[{"samples_ts":[10.0,11.0,12.0]}]\'\n'
-            "fi\n",
+        bp = write_fake_executable(
+            tmp_path,
+            "llama-bench",
+            _llama_bench_script(backends="cpu", output_formats="json"),
         )
-        bp.chmod(0o755)
         mp = tmp_path / "model.gguf"
         _make_gguf(mp)
         jp = tmp_path / "journal.json"
@@ -531,21 +528,11 @@ class TestMain:
         capsys: pytest.CaptureFixture[str],
         tmp_path: Path,
     ) -> None:
-        bp = tmp_path / "llama-bench"
-        bp.write_text(
-            "#!/bin/sh\n"
-            'if [ "$1" = "--version" ]; then\n'
-            '  echo "version: test123"\n'
-            '  echo "backends: cpu"\n'
-            '  echo "supported_flags: -m,-p,-n,-d,-t,-b,-ub,-ngl,-fa,-ctk,-ctv,-o,-r"\n'
-            '  echo "supported_output_formats: json"\n'
-            "elif [ \"$1\" = \"--help\" ]; then\n"
-            '  echo "usage: llama-bench"\n'
-            "else\n"
-            '  echo \'[{"samples_ts":[10.0,11.0,12.0]}]\'\n'
-            "fi\n",
+        bp = write_fake_executable(
+            tmp_path,
+            "llama-bench",
+            _llama_bench_script(backends="cpu", output_formats="json"),
         )
-        bp.chmod(0o755)
         mp = tmp_path / "model.gguf"
         _make_gguf(mp)
         jp = tmp_path / "journal.json"
@@ -580,21 +567,11 @@ class TestMain:
         capsys: pytest.CaptureFixture[str],
         tmp_path: Path,
     ) -> None:
-        bp = tmp_path / "llama-bench"
-        bp.write_text(
-            "#!/bin/sh\n"
-            'if [ "$1" = "--version" ]; then\n'
-            '  echo "version: test123"\n'
-            '  echo "backends: cpu"\n'
-            '  echo "supported_flags: -m,-p,-n,-d,-t,-b,-ub,-ngl,-fa,-ctk,-ctv,-o,-r"\n'
-            '  echo "supported_output_formats: json"\n'
-            "elif [ \"$1\" = \"--help\" ]; then\n"
-            '  echo "usage: llama-bench"\n'
-            "else\n"
-            '  echo \'[{"samples_ts":[10.0,11.0,12.0]}]\'\n'
-            "fi\n",
+        bp = write_fake_executable(
+            tmp_path,
+            "llama-bench",
+            _llama_bench_script(backends="cpu", output_formats="json"),
         )
-        bp.chmod(0o755)
         mp = tmp_path / "model.gguf"
         _make_gguf(mp)
         jp = tmp_path / "journal.json"
@@ -617,21 +594,11 @@ class TestMain:
         capsys: pytest.CaptureFixture[str],
         tmp_path: Path,
     ) -> None:
-        bp = tmp_path / "llama-bench"
-        bp.write_text(
-            "#!/bin/sh\n"
-            'if [ "$1" = "--version" ]; then\n'
-            '  echo "version: test123"\n'
-            '  echo "backends: cpu"\n'
-            '  echo "supported_flags: -m,-p,-n,-d,-t,-b,-ub,-ngl,-fa,-ctk,-ctv,-o,-r"\n'
-            '  echo "supported_output_formats: json"\n'
-            "elif [ \"$1\" = \"--help\" ]; then\n"
-            '  echo "usage: llama-bench"\n'
-            "else\n"
-            '  echo \'[{"samples_ts":[10.0,11.0,12.0]}]\'\n'
-            "fi\n",
+        bp = write_fake_executable(
+            tmp_path,
+            "llama-bench",
+            _llama_bench_script(backends="cpu", output_formats="json"),
         )
-        bp.chmod(0o755)
         mp = tmp_path / "model.gguf"
         _make_gguf(mp)
         jp = tmp_path / "journal.json"
@@ -661,21 +628,7 @@ class TestMain:
         capsys: pytest.CaptureFixture[str],
         tmp_path: Path,
     ) -> None:
-        bp = tmp_path / "llama-bench"
-        bp.write_text(
-            "#!/bin/sh\n"
-            'if [ "$1" = "--version" ]; then\n'
-            '  echo "version: test123"\n'
-            '  echo "backends: cpu,metal"\n'
-            '  echo "supported_flags: -m,-p,-n,-d,-t,-b,-ub,-ngl,-fa,-ctk,-ctv,-o,-r"\n'
-            '  echo "supported_output_formats: json,jsonl"\n'
-            "elif [ \"$1\" = \"--help\" ]; then\n"
-            '  echo "usage: llama-bench"\n'
-            "else\n"
-            '  echo \'[{"samples_ts":[10.0,11.0,12.0]}]\'\n'
-            "fi\n",
-        )
-        bp.chmod(0o755)
+        bp = write_fake_executable(tmp_path, "llama-bench", _llama_bench_script())
         mp = tmp_path / "model.gguf"
         _make_gguf(mp)
         jp = tmp_path / "journal.json"

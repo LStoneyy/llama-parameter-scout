@@ -1276,7 +1276,7 @@ class TestFullShardIdentity:
         shards_data = mm.get("shards", [])
         assert len(shards_data) == 1
         s = shards_data[0]
-        assert s["path"] == "/tmp/model-shard-00001.gguf"
+        assert s["path"] == str(Path("/tmp/model-shard-00001.gguf"))
         assert s["size_bytes"] == 4_000_000_000
         assert s["modified_time"] == 1234567890.0
         assert s["digest_sha256"] == "abc123"

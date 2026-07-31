@@ -944,7 +944,7 @@ class TestMtpPresetRendering:
         )
 
         assert "Preset.ini (MTP recommendation)" in md
-        assert "model-draft = /draft.gguf" in md
+        assert f"model-draft = {Path('/draft.gguf')}" in md
         assert "n-gpu-layers-draft = 0" in md
         assert "spec-draft-n-max = 16" in md
 
@@ -979,7 +979,7 @@ class TestMtpPresetRendering:
         data = json.loads(j)
         mp = data["mtp_profile"]
         assert "mtp_preset" in mp
-        assert mp["mtp_preset"]["model_draft"] == "/draft.gguf"
+        assert mp["mtp_preset"]["model_draft"] == str(Path("/draft.gguf"))
         assert mp["mtp_preset"]["draft_settings"]["n_gpu_layers_draft"] == 0
         assert mp["mtp_preset"]["draft_settings"]["draft_max"] == 16
 

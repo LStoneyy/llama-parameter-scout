@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import io
 import struct
+import sys
 from pathlib import Path
 
 import pytest
 
 from llama_parameter_scout.model_inspector import (
+    _extra_shard_glob,
     _GGUFReadBudget,
     _has_symlink_ancestor,
     _is_url,
@@ -637,6 +639,10 @@ class TestShardPrefix:
         assert primary is not None
         return primary
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="'*' and '?' are invalid characters in Windows filenames",
+    )
     def test_prefix_with_star(self, tmp_path: Path) -> None:
         primary = self._build_shards(tmp_path, "my*-model", 3)
         decoy = tmp_path / "myX-model-00001-of-00003.gguf"
@@ -645,6 +651,10 @@ class TestShardPrefix:
         assert fp.architecture == "llama"
         assert len(fp.shards) == 3
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="'*' and '?' are invalid characters in Windows filenames",
+    )
     def test_prefix_with_question(self, tmp_path: Path) -> None:
         primary = self._build_shards(tmp_path, "my?-model", 3)
         decoy = tmp_path / "myX-model-00001-of-00003.gguf"
@@ -676,3 +686,25 @@ class TestShardPrefix:
         fp = inspect_model(primary)
         assert fp.architecture == "llama"
         assert len(fp.shards) == 3
+
+
+class TestExtraShardGlob:
+    """Pure, platform-independent checks that _extra_shard_glob escapes
+    glob metacharacters in the prefix so they cannot act as wildcards.
+    """
+
+    def test_escapes_star(self) -> None:
+        pattern = _extra_shard_glob("my*-model", 3, 5)
+        assert pattern == "my[*]-model-*-of-00003.gguf"
+
+    def test_escapes_question_mark(self) -> None:
+        pattern = _extra_shard_glob("my?-model", 3, 5)
+        assert pattern == "my[?]-model-*-of-00003.gguf"
+
+    def test_escapes_bracket_open(self) -> None:
+        pattern = _extra_shard_glob("my[-model", 3, 5)
+        assert pattern == "my[[]-model-*-of-00003.gguf"
+
+    def test_unescaped_middle_star_is_wildcard(self) -> None:
+        pattern = _extra_shard_glob("model", 3, 5)
+        assert pattern == "model-*-of-00003.gguf"

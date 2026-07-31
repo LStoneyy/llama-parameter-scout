@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import struct
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,46 @@ def fake_binary(tmp_path: Path) -> Path:
     p.write_text("#!/bin/sh\necho hello")
     p.chmod(0o755)
     return p
+
+
+def write_fake_executable(directory: Path, name: str, python_body: str) -> Path:
+    """Create a fake "binary" that real production code can spawn directly.
+
+    Production code always builds argv as ``[str(binary_path), *flags]`` (no
+    interpreter prefix), so the returned path must itself be directly
+    executable by ``subprocess.Popen``/``CreateProcess``.
+
+    ``python_body`` is Python source that runs as a standalone script: read
+    arguments from ``sys.argv[1:]``, write to ``sys.stdout``/``sys.stderr``,
+    and call ``sys.exit(code)`` to control the exit code.
+
+    - On POSIX, ``directory/name`` *is* the script: a ``#!{sys.executable}``
+      shebang followed by ``python_body``, made executable via
+      ``chmod(0o755)``.
+    - On Windows, ``CreateProcess`` cannot exec an interpreted script
+      directly (``OSError: [WinError 193] %1 is not a valid Win32
+      application``), but it has documented special-case handling for
+      ``.bat``/``.cmd`` files. So ``python_body`` is written to a sidecar
+      ``directory/{name}.py``, and ``directory/{name}.bat`` is created to
+      invoke it with the current interpreter, forwarding all arguments.
+      ``chmod`` is skipped on Windows, where it is meaningless.
+
+    Returns the path that should be handed to production code as the
+    "binary" path.
+    """
+    if sys.platform == "win32":
+        impl_path = directory / f"{name}.py"
+        impl_path.write_text(python_body, encoding="utf-8")
+        binary_path = directory / f"{name}.bat"
+        binary_path.write_text(
+            f'@echo off\r\n"{sys.executable}" "{impl_path}" %*\r\n',
+            encoding="utf-8",
+        )
+        return binary_path
+    binary_path = directory / name
+    binary_path.write_text(f"#!{sys.executable}\n{python_body}", encoding="utf-8")
+    binary_path.chmod(0o755)
+    return binary_path
 
 
 @pytest.fixture

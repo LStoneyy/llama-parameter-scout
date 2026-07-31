@@ -120,7 +120,7 @@ def _atomic_write(path: Path, data: dict[str, Any]) -> None:
         suffix=".tmp",
     )
     try:
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
             f.flush()
             os.fsync(f.fileno())

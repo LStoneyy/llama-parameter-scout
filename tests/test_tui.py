@@ -62,6 +62,32 @@ def _text(widget: Any) -> str:
     return str(widget)
 
 
+async def _wait_for_richlog(
+    pilot: Any, screen: Any, selector: str, expected: str, *, attempts: int = 20,
+) -> str:
+    """Poll ``selector``'s rendered text until it contains ``expected``.
+
+    Textual's ``RichLog`` defers rendering until the widget receives a
+    non-zero-width ``Resize`` event. A widget inside an inactive
+    ``TabbedContent`` pane only receives that ``Resize`` once its pane is
+    activated and laid out, and a single ``await pilot.pause()`` after
+    switching ``tabs.active`` is not guaranteed to span the whole
+    display-toggle -> layout -> Resize -> deferred-flush chain. Poll for a
+    bounded number of iterations instead of asserting after one pause, so the
+    test stays robust without relying on unconditional sleeps.
+    """
+    text = _text(screen.query_one(selector))
+    for _ in range(attempts):
+        if expected in text:
+            return text
+        await pilot.pause()
+        text = _text(screen.query_one(selector))
+    raise AssertionError(
+        f"Expected {expected!r} not found in {selector!r} after {attempts} "
+        f"pilot.pause() iterations; last rendered text was {text!r}"
+    )
+
+
 _SAMPLE_TOPO = SystemTopology(
     cpu_count=8, system_memory_bytes=17179869184,
     accelerators=(Accelerator(kind="gpu", backend="metal", device_id=0,
@@ -1291,9 +1317,7 @@ async def test_results_preset_export_plain_text(tmp_path: Path, monkeypatch: Any
         assert isinstance(screen, ResultsScreen)
         tabs = screen.query_one(TabbedContent)
         tabs.active = "tab-preset"
-        await pilot.pause()
-
-        visible = _text(screen.query_one("#preset-content"))
+        visible = await _wait_for_richlog(pilot, screen, "#preset-content", "ctx-size =")
         assert visible.startswith("[model]")
 
         screen.action_copy_preset()
@@ -1340,8 +1364,7 @@ async def test_results_preset_includes_mmproj_when_set(tmp_path: Path) -> None:
         await pilot.pause()
         tabs = app.screen.query_one(TabbedContent)
         tabs.active = "tab-preset"
-        await pilot.pause()
-        visible = _text(app.screen.query_one("#preset-content"))
+        visible = await _wait_for_richlog(pilot, app.screen, "#preset-content", "mmproj =")
         assert str(mmproj_file) in visible
         assert "mmproj =" in visible
 
@@ -1362,8 +1385,7 @@ async def test_results_preset_no_mmproj_when_empty(tmp_path: Path) -> None:
         await pilot.pause()
         tabs = app.screen.query_one(TabbedContent)
         tabs.active = "tab-preset"
-        await pilot.pause()
-        visible = _text(app.screen.query_one("#preset-content"))
+        visible = await _wait_for_richlog(pilot, app.screen, "#preset-content", "ctx-size =")
         assert "mmproj =" not in visible
 
 
@@ -1387,8 +1409,7 @@ async def test_results_shell_includes_mmproj_in_commands(tmp_path: Path) -> None
         await pilot.pause()
         tabs = app.screen.query_one(TabbedContent)
         tabs.active = "tab-shell"
-        await pilot.pause()
-        visible = _text(app.screen.query_one("#shell-content"))
+        visible = await _wait_for_richlog(pilot, app.screen, "#shell-content", "--mmproj")
         assert str(mmproj_file) in visible
         assert "--mmproj" in visible
 
@@ -1423,14 +1444,12 @@ async def test_results_nowinner_shows_no_winner() -> None:
         assert "No validated recommendation" in _text(app.screen.query_one("#md-content"))
         tabs = app.screen.query_one(TabbedContent)
         tabs.active = "tab-preset"
-        await pilot.pause()
-        assert "No validated recommendation" in _text(
-            app.screen.query_one("#preset-content")
+        await _wait_for_richlog(
+            pilot, app.screen, "#preset-content", "No validated recommendation",
         )
         tabs.active = "tab-shell"
-        await pilot.pause()
-        assert "No validated recommendation" in _text(
-            app.screen.query_one("#shell-content")
+        await _wait_for_richlog(
+            pilot, app.screen, "#shell-content", "No validated recommendation",
         )
 
 
@@ -1492,7 +1511,7 @@ async def test_keyboard_f10_advances(tmp_path: Path) -> None:
 # ── Application validation progress (unit) ──────────────────────
 
 
-async def test_validate_candidates_emits_progress() -> None:
+async def test_validate_candidates_emits_progress(tmp_path: Path) -> None:
     """Application.validate_candidates with injected evaluator emits before/after events."""
     from llama_parameter_scout.application import Application
 
@@ -1533,9 +1552,17 @@ async def test_validate_candidates_emits_progress() -> None:
     )
 
     from llama_parameter_scout.runner import FakeRunner, ProcessResult
+
+    bp = tmp_path / "llama-bench"
+    bp.touch()
+    bp.chmod(0o755)
+    mp = tmp_path / "model.gguf"
+    mp.touch()
+    journal_path = tmp_path / "j.json"
+
     runner = FakeRunner()
     runner.enqueue(
-        (str(Path("/tmp/llama-bench")), "--version"),
+        (str(bp), "--version"),
         ProcessResult(returncode=0, stdout=(
             "version: test\nbackends: cpu\n"
             "supported_flags: -m,-p,-n,-d,-t,-b,-ub,-ngl,-fa,-ctk,-ctv,-o,-r\n"
@@ -1543,19 +1570,14 @@ async def test_validate_candidates_emits_progress() -> None:
         ), stderr=""),
     )
     runner.enqueue(
-        (str(Path("/tmp/llama-bench")), "--help"),
+        (str(bp), "--help"),
         ProcessResult(returncode=0, stdout="usage: llama-bench\n", stderr=""),
     )
     app = Application(runner=runner)
 
-    bp = Path("/tmp/llama-bench")
-    bp.touch()
-    bp.chmod(0o755)
-    mp = Path("/tmp/model.gguf")
-    mp.touch()
     request = SingleRunRequest(
         binary_path=bp, model_path=mp,
-        journal_path=Path("/tmp/j.json"),
+        journal_path=journal_path,
         n_ctx=NctxComposition(total=64, prompt=16, generation=32, depth=16),
         candidate=base,
     )

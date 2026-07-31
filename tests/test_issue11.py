@@ -254,7 +254,7 @@ class TestBuildServerArgv:
             8080, _ctx2048(), _big_candidate(), cpu_only=True, device_id=None,
         )
         assert "-md" in argv
-        assert argv[argv.index("-md") + 1] == "/draft.gguf"
+        assert argv[argv.index("-md") + 1] == str(Path("/draft.gguf"))
 
     def test_no_draft_when_none(self) -> None:
         argv = _build_server_argv(
@@ -616,7 +616,7 @@ class TestStartServerWithRetry:
             _ctx2048(), _big_candidate(), cpu_only=True, device_id=None,
         )
         assert "-md" in argv
-        assert argv[argv.index("-md") + 1] == "/draft.gguf"
+        assert argv[argv.index("-md") + 1] == str(Path("/draft.gguf"))
 
 
 # ── Send completion tests ────────────────────────────────────────
